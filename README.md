@@ -7,5 +7,6 @@ Our goal is to aid analysis of translation in the context of differential isofor
 
 ### Prerequisites 
 
-[Overview of previous publications on isoform-aware ORF annlotation](https://github.com/ashakru/BilbORF/blob/main/doc/prerequisites.md)
+[Overview of previous publications on isoform-aware ORF annlotation](https://github.com/ashakru/BilbORF/blob/main/doc/prerequisites.md)  
+
 [R Package structure and state](https://r-pkgs.org/structure.html)
