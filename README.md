@@ -1,5 +1,5 @@
 # BilbORF
-R package for performing differential ORF usage analysis  
+Open science project developing an R package for performing differential ORF usage analysis  
 
 ### Background
 
