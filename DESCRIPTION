@@ -1,0 +1,11 @@
+Package: BilbORF
+Title: R package for performing differential ORF usage analysis
+Version: 0.0.0.9000
+Authors@R: 
+    person("Joanna", "Krupka", , "jak75@cam.ac.uk", role = c("aut", "cre"),
+           comment = c(ORCID = "https://orcid.org/0000-0003-0369-0329"))
+Description: BilbORF package provides a toolkit for analysing translation of selected Open Reading Frames (ORFs) in the context of dynamic transcript isoform changes.
+License: MIT + file LICENSE
+Encoding: UTF-8
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.2.3
