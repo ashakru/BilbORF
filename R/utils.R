@@ -63,3 +63,21 @@ rank_exons <- function(grl){
   return(grl)
 
 }
+
+simplify_grl <- function(grl){
+
+  names <- names(grl)
+
+  grl <- map2(grl, name, function(x, y){
+    x <- GRanges(seqnames = seqnames(x),
+                 IRanges(ranges(x)),
+                 strand = strand(x))
+    names(x) <- rep(y, length(x))
+    return(x)
+      }
+    )
+
+  grl <- GRangesList(grl)
+
+  return(grl)
+}

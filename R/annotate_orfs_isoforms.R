@@ -1,20 +1,39 @@
-#' Title
+#' Annotate ORF with their status respective of
 #'
-#' @param annotations
-#' @param orfs
-#' @param transcript_meta
-#' @param orfs_meta
-#' @param start_codons
-#' @param stop_codons
+#' @param annotations List with genomic annotations, output of `prepare_annotations()`
+#' @param orfs GRanges or GRangesList with genomic coordinates of ORFs of interest
+#' @param transcript_meta (optional) A data.frame with transcript metadata (for example: gene_name, gene_id, transcript_type), must contain a column `transcript_id` compatible with `names(annotations$transcripts)`
+#' @param orfs_meta (optional) A data.frame with ORF metadata, must contain a column `ORF_id` compatible with `names(orfs)`
+#' @param start_codons A vector with codons recognized as start codon; default `c("ATG","TTG","CTG","GTG")`
+#' @param stop_codons A vector with codons recognized as stop codon; default `c("TAG", "TAA", "TGA")`
 #'
-#' @return
+#' @return A list containing a table with annotated ORF-transcript pairs (`$table`) and GRangesList with genomic coordinates of identified ORFs (`$ranges`)
 #' @import GenomicRanges
 #' @import ORFik
 #' @export
 #'
 #' @examples
+#' BSgenome <- BSgenome.Hsapiens.UCSC.hg38
+#' gtf <- "inst/extdata/gencode.v35.annotation_chr10.gtf"
+#' bed <- "inst/extdata/Ribo-seq_ORFs.bed"
+#'
+#' # Prepare annotations
+#' annotations <- prepare_annotations_fromGTF(gtf, BSgenome)
+#'
+#' # Pull transcripts metadata
+#' transcripts_meta <- import(gtf, format = "GTF") %>%
+#'   as.data.frame() %>%
+#'   dplyr::filter(type == "transcript") %>%
+#'   dplyr::select(gene_name, transcript_id, transcript_type) %>%
+#'   distinct()
+#'
+#' # Load ORFs
+#' orfs <- import(bed, format = "BED")
+#' names(orfs) <- orfs$name
+#' orf_tab <- as.data.frame(orfs)
+#' annotated_orfs <- annotate_orf_isoforms(annotations, orfs, BSgenome, transcripts_meta)
 annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
-                                  transcript_meta = NULL, orfs_meta = NULL,
+                                  transcript_meta, orfs_meta = NULL,
                                   start_codons = c("ATG","TTG","CTG","GTG"),
                                   stop_codons = c("TAG", "TAA", "TGA")){
 
