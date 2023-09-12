@@ -106,7 +106,8 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
       left_join(orf_meta, by = "ORF_id")
   }
 
-  return(orf_status)
+  return(list(table = orf_status,
+              ranges = orf_in_tx))
 
 }
 

@@ -23,26 +23,12 @@ check_seq_levels <- function(x, y){
 
 }
 
-get_start_position <- function(grl){
-
-  starts <- sapply(grl, function(x){
-    min(start(x))
-  })
-
-  return(starts)
-
-}
-
-get_stop_position <- function(grl){
-
-  ends <- sapply(grl, function(x){
-    max(end(x))
-  })
-
-  return(ends)
-
-}
-
+#' Function to assign appropriate exon ranking depending on the ranges strand
+#'
+#' @param grl GRangesList object
+#'
+#' @return GRangesList with exon ranks added
+#' @export
 rank_exons <- function(grl){
 
     grl <- lapply(grl, function(x){
@@ -64,6 +50,7 @@ rank_exons <- function(grl){
 
 }
 
+#### Draft functions for Kozak sequence score calculation
 simplify_grl <- function(grl){
 
   names <- names(grl)
@@ -80,4 +67,24 @@ simplify_grl <- function(grl){
   grl <- GRangesList(grl)
 
   return(grl)
+}
+
+get_start_position <- function(grl){
+
+  starts <- sapply(grl, function(x){
+    min(start(x))
+  })
+
+  return(starts)
+
+}
+
+get_stop_position <- function(grl){
+
+  ends <- sapply(grl, function(x){
+    max(end(x))
+  })
+
+  return(ends)
+
 }
