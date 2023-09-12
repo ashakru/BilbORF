@@ -44,6 +44,18 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
   seq_nt <- extractTranscriptSeqs(BSgenome, orf_in_tx)
   seq_aa <- suppressWarnings(translate(seq_nt))
 
+  # Computing Kozak sequence
+  # orf_test <- simplify_grl(orf_in_tx[1:2])
+  # orf_test <- makeORFNames(orf_in_tx[1:2])
+  # names(orf_test) <- names(tx_by_orf[1:2])
+  # tx_test <- tx_by_orf[names(orf_test)]
+  # tx_test <- makeORFNames(tx_test)
+  #
+  # kozakSequenceScore(orf_test[1], tx_test[[1]], BSgenome)
+  # pmapToTranscriptF(orf_test, tx[names(orf_test)])
+  # sequences <- startRegionString(orf_test, tx[names(orf_test)], BSgenome, 2, 3)
+  # grl <- startRegion(orf_test, tx[names(orf_test)], is.sorted = TRUE, 9, 5)
+
   # Assign ORF status
   orf_status <- tibble(ORF_isoform_id = names(orf_in_tx),
                        ORF_id = names(orf_by_tx),
