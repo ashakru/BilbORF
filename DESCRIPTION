@@ -15,5 +15,8 @@ Imports:
     GenomicFeatures (>= 1.50.4),
     dplyr (>= 1.1.1)
 Suggests: 
+    knitr,
+    rmarkdown,
     testthat (>= 3.0.0)
 Config/testthat/edition: 3
+VignetteBuilder: knitr

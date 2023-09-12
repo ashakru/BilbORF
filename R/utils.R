@@ -23,3 +23,61 @@ check_seq_levels <- function(x, y){
 
 }
 
+get_start_position <- function(grl){
+
+  starts <- sapply(grl, function(x){
+    min(start(x))
+  })
+
+  return(starts)
+
+}
+
+get_stop_position <- function(grl){
+
+  ends <- sapply(grl, function(x){
+    max(end(x))
+  })
+
+  return(ends)
+
+}
+
+rank_exons <- function(grl){
+
+    grl <- lapply(grl, function(x){
+      str <- as.character(strand(x))
+      if(all(str == "-")) {
+        x$exon_rank <- length(x):1
+      } else {
+        x$exon_rank <- 1:length(x)
+      }
+
+      x <- x[order(x$exon_rank, decreasing = F)]
+
+      return(x)
+    })
+
+  grl <- GRangesList(grl)
+
+  return(grl)
+
+}
+
+simplify_grl <- function(grl){
+
+  names <- names(grl)
+
+  grl <- map2(grl, name, function(x, y){
+    x <- GRanges(seqnames = seqnames(x),
+                 IRanges(ranges(x)),
+                 strand = strand(x))
+    names(x) <- rep(y, length(x))
+    return(x)
+      }
+    )
+
+  grl <- GRangesList(grl)
+
+  return(grl)
+}
