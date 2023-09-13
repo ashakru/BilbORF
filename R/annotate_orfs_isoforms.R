@@ -11,7 +11,7 @@
 #' @import ORFik
 #' @import tibble
 #' @importFrom GenomicFeatures extractTranscriptSeqs
-#' @importFrom dplyr mutate case_when left_join
+#' @importFrom dplyr mutate case_when left_join group_by relocate
 #' @export
 #' @examples
 #' BSgenome <- BSgenome.Hsapiens.UCSC.hg38
@@ -64,7 +64,7 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
   seq_nt <- extractTranscriptSeqs(BSgenome, orf_in_tx)
   seq_aa <- suppressWarnings(translate(seq_nt))
 
-  # Computing Kozak sequence
+  # Computing Kozak sequence (currently not working)
   # orf_test <- simplify_grl(orf_in_tx[1:2])
   # orf_test <- makeORFNames(orf_in_tx[1:2])
   # names(orf_test) <- names(tx_by_orf[1:2])
@@ -82,6 +82,9 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
                        transcript_id = names(tx_by_orf),
                        seq_nt = as.character(seq_nt),
                        seq_aa = as.character(seq_aa),
+                       len_nt = nchar(seq_nt),
+                       len_aa = nchar(gsub("*", "", seq_aa)),
+                       seqnames = sapply(orf_in_tx, function(x){unique(seqnames(x))}),
                        start = get_start_position(orf_in_tx),
                        end = get_stop_position(orf_in_tx)) %>%
     mutate(length_nt = nchar(seq_nt),
@@ -93,7 +96,10 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
                                   !(start_codon %in% start_codons) & !(stop_codon %in% stop_codons) ~ "no_stop_no_start",
                                   !(stop_codon %in% stop_codons) ~ "no_stop",
                                   !(start_codon %in% start_codons) ~ "no_start",
-                                  (start_codon %in% start_codons) & (stop_codon %in% stop_codons) ~ "translatable"))
+                                  (start_codon %in% start_codons) & (stop_codon %in% stop_codons) ~ "translatable")) %>%
+    group_by(ORF_id, orf_status) %>%
+    mutate(unique_iso_n =  as.numeric(factor(seq_aa)),
+           unique_tx_iso = paste(orf_status, unique_iso_n, sep = "_"))
 
   # Join transcript metadata table, if present
  orf_status <- orf_status %>%
@@ -105,6 +111,11 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
     orf_status <- orf_status %>%
       left_join(orf_meta, by = "ORF_id")
   }
+
+ # Relocate the most important columns
+ orf_status <- orf_status %>%
+   dplyr::relocate(ORF_isoform_id, ORF_id, transcript_id, gene_id, gene_name,
+                   seqnames, start, end, start_codon, stop_codon, orf_status)
 
   return(list(table = orf_status,
               ranges = orf_in_tx))
