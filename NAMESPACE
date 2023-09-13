@@ -2,7 +2,12 @@
 
 export(annotate_orf_isoforms)
 export(check_seq_levels)
+export(count_p_sites)
 export(prepare_annotations_fromGTF)
+export(rank_exons)
 import(GenomicFeatures)
 import(GenomicRanges)
 import(ORFik)
+import(Rsamtools)
+import(dplyr)
+import(tidyr)
