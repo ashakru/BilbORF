@@ -8,10 +8,11 @@
 #' @param stop_codons A vector with codons recognized as stop codon; default `c("TAG", "TAA", "TGA")`
 #'
 #' @return A list containing a table with annotated ORF-transcript pairs (`$table`) and GRangesList with genomic coordinates of identified ORFs (`$ranges`)
-#' @import GenomicRanges
 #' @import ORFik
+#' @import tibble
+#' @importFrom GenomicFeatures extractTranscriptSeqs
+#' @importFrom dplyr mutate case_when left_join
 #' @export
-#'
 #' @examples
 #' BSgenome <- BSgenome.Hsapiens.UCSC.hg38
 #' gtf <- "inst/extdata/gencode.v35.annotation_chr10.gtf"

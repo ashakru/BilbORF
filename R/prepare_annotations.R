@@ -4,7 +4,7 @@
 #' @param BSgenome BSgenome object compatible with provided GTF file
 #'
 #' @return GRangesList with genomic coordinates of different genomic regions
-#' @import GenomicFeatures
+#' @importFrom GenomicFeatures makeTxDbFromGFF exonsBy
 #' @export
 #'
 #' @examples
