@@ -1,15 +1,17 @@
-#' Title
+#' Count P-sites within selected ORFs
 #'
-#' @param bam
-#' @param offsets
-#' @param annotated_orfs
-#' @param transcripts_meta
+#' This function analyzes sequencing data stored in a BAM file format to identify P-sites (ribosome profiling sites) within annotated open reading frames (ORFs).
 #'
-#' @return
-#' @export
-#' @import ORFik
-#' @import tidyr
+#' @param bam Path to the BAM file containing the sequencing data.
+#' @param offsets A data frame containing information about the fractional offsets for P-site identification.
+#' @param annotated_orfs A data frame containing genomic coordinates of annotated ORFs.
+#'
+#' @return A data frame containing computed metrics related to P-sites, entropy, and ORF scores per frame.
+#' @import Rsamtools GenomicRanges dplyr tidyr
 #' @examples
+#' results <- count_p_sites("example.bam", offsets_df, annotated_orfs_df)
+#' @export
+#'
 count_p_sites <- function(bam, offsets, annotated_orfs){
 
   # Load BAM

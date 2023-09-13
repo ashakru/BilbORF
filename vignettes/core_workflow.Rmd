@@ -19,6 +19,10 @@ knitr::opts_chunk$set(
 
 The human genome is thought to contain approximately 20,000 protein-coding sequences.
 However, emerging evidence suggest that the complexity of protein-coding regions is far more than that. 
+The ability of new sequencing techniques, such as Ribo-Seq, to map the position of every translating ribosome in the cell provides an unprecedented opportunity to re-examine the cell proteome revealing previously unknown proteins. 
+To characterize the novel proteins correctly, we need a toolkit for accurate annotations. 
+If we annotate these ORFs with incorrect transcripts, then further analyses may be invalid.
+
 
 ```{r out.width = '70%', echo = FALSE}
 knitr::include_graphics("img/orf_translation_splicing.png")
@@ -42,6 +46,7 @@ gtf <- "inst/extdata/gencode.v35.annotation_chr10.gtf"
 
 # Prepare annotations
 annotations <- prepare_annotations_fromGTF(gtf, BSgenome)
+str(annotations)
 ```
 
 ## Identify ORF translation status depending on ORFs
@@ -63,4 +68,96 @@ orf_tab <- as.data.frame(orfs)
 
 # Annotate ORF status on all overlapping transcripts 
 annotated_orfs <- annotate_orf_isoforms(annotations, orfs, BSgenome, transcripts_meta)
+head(annotated_orfs)
+```
+
+## Quantify P-sites abundance and frame preference for each ORF  
+
+```{r}
+bam <- "inst/extdata/riboseq_chr10.bam"
+
+offsets <- data.frame(fraction = c(25:30),
+                      offsets_start = -12) 
+
+orf_translation <- count_p_sites(bam, offsets, annotated_orfs)
+```
+
+## Prepare differential transcript abundance results (example: DRIMSeq workflow)
+
+```{r}
+library(DRIMSeq)
+
+# Load data
+gtex_tx <- read_delim("inst/extdata/quantification_gencode.counts.txt")
+gtex_meta <- read_csv("inst/extdata/GTEx_longReads_Seq_meta.csv") %>%
+  dplyr::filter(sample_id %in% colnames(gtex_tx))
+
+# Pull transcript metadata
+transcripts_table <- read_csv("inst/extdata/gencode.v35.tx2gene.csv")
+transcripts_table <- transcripts_table %>%
+  dplyr::mutate(transcript_ensembl_id = sapply(strsplit(transcript_id, "[.]"), function(x){x[1]}))
+
+# Prepare input for DRIMSeq
+meta <- gtex_meta %>%
+  dplyr::filter(tissue %in% c("Liver", "Lung")) %>%
+  mutate(group = factor(tissue),
+         label = sample_id) %>%
+  group_by(group) %>%
+  mutate(sample_id = paste(group, 1:length(group), sep = "_"))  %>%
+  as.data.frame() 
+
+counts <- gtex_tx %>%
+  dplyr::select(transcript, any_of(meta$label)) %>%
+  rename(feature_id = transcript) %>%
+  mutate(feature_id = sapply(strsplit(feature_id, "[.]"), function(x){x[1]})) %>%
+  left_join(dplyr::select(transcripts_table, gene_id, transcript_ensembl_id),
+            by = c("feature_id" = "transcript_ensembl_id")) %>%
+  relocate(gene_id) %>%
+  mutate(feature_id = make.unique(feature_id)) %>%
+  as.data.frame() %>%
+  dplyr::filter(!is.na(gene_id))
+colnames(counts)[-1:-2] <- meta$sample_id
+
+# Differential transcript usage
+d <- dmDSdata(counts = counts, samples = meta)
+d <- dmFilter(d, min_samps_gene_expr = 7, min_samps_feature_expr = 3,
+              min_gene_expr = 10, min_feature_expr = 10)
+design_full <- model.matrix(~ group, data = samples(d))
+
+set.seed(123)
+d <- dmPrecision(d, design = design_full)
+d <- dmFit(d, design = design_full, verbose = 1)
+d <- dmTest(d, coef = "groupLung", verbose = 1)
+
+# Tidy results
+dtu_results <- results(d, level = "feature") %>%
+  left_join(proportions(d)) %>%
+  mutate(mean_lung = rowMeans(dplyr::select(., starts_with("Lung")), na.rm = TRUE),
+         mean_liver = rowMeans(dplyr::select(., starts_with("Liver")), na.rm = TRUE),
+         log2FoldChange = log2(mean_lung/mean_liver)) %>%
+  dplyr::rename(transcript_id = feature_id) %>%
+  arrange(adj_pvalue) %>%
+  left_join(dplyr::select(transcripts_table, transcript_ensembl_id, gene_name), 
+            by = c("transcript_id" = "transcript_ensembl_id")) %>%
+  relocate(gene_name, gene_id, transcript_id, pvalue, adj_pvalue, mean_lung, mean_liver, log2.FC) 
+
+# Save results
+write_csv(dtu_results, file = "inst/extdata/DRIMSeq_lung_liver_GTEx_longReads_Seq.csv")
+```
+
+## Identify events of differential ORF usage
+
+```{r}
+dtu_results <- read_csv("inst/extdata/DRIMSeq_lung_liver_GTEx_longReads_Seq.csv")
+dtu_results <- dtu_results %>%
+  mutate(rank = log2FoldChange)
+
+selected_genes <- dtu_results %>%
+  mutate(hasORF = transcript_id %in% sapply(strsplit(annotated_orfs$table$transcript_id, "[.]"), 
+                                            function(x){x[1]})) %>%
+  group_by()
+
+
+
+
 ```

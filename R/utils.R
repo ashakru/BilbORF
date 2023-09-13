@@ -26,8 +26,7 @@ check_seq_levels <- function(x, y){
 #' Function to assign appropriate exon ranking depending on the ranges strand
 #'
 #' @param grl GRangesList object
-#'
-#' @return GRangesList with exon ranks added
+#' @return A list of genomic ranges objects with exon ranks assigned.
 #' @export
 rank_exons <- function(grl){
 

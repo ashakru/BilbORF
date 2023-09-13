@@ -50,7 +50,7 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
   # Get spliced coordinates
   orf_by_tx <- orfs[queryHits(orf_tx_overlap)]
   tx_by_orf <- tx[subjectHits(orf_tx_overlap)]
-  orf_in_tx <- intersect(tx_by_orf, orf_by_tx)
+  orf_in_tx <- GenomicRanges::intersect(tx_by_orf, orf_by_tx)
 
   # Rank exons
   orf_in_tx <- rank_exons(orf_in_tx)
@@ -95,10 +95,9 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
                                   (start_codon %in% start_codons) & (stop_codon %in% stop_codons) ~ "translatable"))
 
   # Join transcript metadata table, if present
-  if (!is.null(transcript_meta)) {
-    orf_status <- orf_status %>%
+ orf_status <- orf_status %>%
       left_join(transcript_meta, by = "transcript_id")
-  }
+
 
   # Join ORF metadata table, if present
   if (!is.null(orfs_meta)) {
