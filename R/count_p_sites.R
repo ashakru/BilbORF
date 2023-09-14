@@ -7,7 +7,7 @@
 #' @param annotated_orfs A data frame containing genomic coordinates of annotated ORFs.
 #'
 #' @return A data frame containing computed metrics related to P-sites, entropy, and ORF scores per frame.
-#' @import Rsamtools GenomicRanges dplyr tidyr
+#' @import ORFik
 #' @examples
 #' results <- count_p_sites("example.bam", offsets_df, annotated_orfs_df)
 #' @export
