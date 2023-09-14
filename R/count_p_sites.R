@@ -8,6 +8,7 @@
 #'
 #' @return A data frame containing computed metrics related to P-sites, entropy, and ORF scores per frame.
 #' @import ORFik
+#' @importFrom dplyr rename summarise
 #' @examples
 #' results <- count_p_sites("example.bam", offsets_df, annotated_orfs_df)
 #' @export
@@ -43,9 +44,9 @@ count_p_sites <- function(bam, offsets, annotated_orfs){
                                      exclude.zero.cov.grl = T) %>%
     group_by(genes, frame) %>%
     mutate(frame = paste0("frame_", frame)) %>%
-    summarise(p_sites = sum(score)) %>%
+    dplyr::summarise(p_sites = sum(score)) %>%
     tidyr::spread(frame, p_sites) %>%
-    rename(ORF_id = genes) %>%
+    dplyr::rename(ORF_id = genes) %>%
     mutate(frames_sum = frame_0 + frame_1 + frame_2)
 
   # Concentrate results table
