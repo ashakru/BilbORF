@@ -76,7 +76,7 @@ head(annotated_orfs)
 ```{r}
 bam <- system.file("extdata", "riboseq_chr10.bam", package = "BilbORF")
 
-offsets <- data.frame(fraction = c(25:30),
+offsets <- data.frame(fraction = 25:30,
                       offsets_start = -12) 
 
 orf_translation <- count_p_sites(bam, offsets, annotated_orfs)
@@ -152,7 +152,7 @@ mat_unscaled <- as.tibble(gene_stats) %>%
 mat <- scale(mat_unscaled)
 
 # Graphics
-col_fun = colorRamp2(c(-2, 0, 2), rev(c("#4D004B", "#8C96C6", "#9EBCDA")))
+col_fun <- colorRamp2(c(-2, 0, 2), rev(c("#4D004B", "#8C96C6", "#9EBCDA")))
 col_fun(seq(-3, 3))
 
 # Heatmap
@@ -161,19 +161,17 @@ Heatmap(mat,
         cluster_columns = F,
         col = col_fun,
         rect_gp = gpar(col = "white", lwd = 2),
-        cell_fun = function(j, i, x, y, w, h, col) { # add text to each grid
-          grid.text(mat_unscaled[i, j], x, y,
-                    gp = gpar(col = "white"))
-          
-          })
+        cell_fun = function(j, i, x, y, w, h, col) {
+          grid.text(mat[i, j], x, y, gp = gpar(col = "white")) # Set text color to white
+        })
 
 # Examples: NUTM2B-AS1 and ADK
 examples <- c("ENSG00000225484.7", "ENSG00000156110.14")
-col_dtu = colorRamp2(c(-2, 0, 2), c("#225EA8", "white", "#E31A1C"))
-col_orf = structure(c("#4D004B", "#8C6BB1", "#D4B9DA", "#8C96C6", "#9EBCDA","#BFD3E6", "grey"), 
+col_dtu <-  colorRamp2(c(-2, 0, 2), c("#225EA8", "white", "#E31A1C"))
+col_orf <-  structure(c("#4D004B", "#8C6BB1", "#D4B9DA", "#8C96C6", "#9EBCDA","#BFD3E6", "grey"),
                     names = c("translatable_1", "translatable_2", "internal_stop", "no_stop_no_start", "no_stop", "orf_loss"))
 
-for (e in 1:length(examples)){
+for (e in seq_along(examples)){
   gene_tab <- orf_landscape$gene_tables[[examples[e]]]
   print(gene_tab)
   gene_name <- gene_stats$gene_name[gene_stats$gene_id == examples[e]]
@@ -214,5 +212,8 @@ for (e in 1:length(examples)){
   draw(ht_list, column_title = gene_name)
   
 }
+
+
+```
 
 ```
