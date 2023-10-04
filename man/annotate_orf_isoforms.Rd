@@ -17,7 +17,7 @@ annotate_orf_isoforms(
 \arguments{
 \item{annotations}{List with genomic annotations, output of \code{prepare_annotations()}}
 
-\item{orfs}{GRanges or GRangesList with genomic coordinates of ORFs of interest}
+\item{orfs}{GRanges or GRangesList with genomic coordinates of the start and stop codons for ORFs of interest}
 
 \item{transcript_meta}{(optional) A data.frame with transcript metadata (for example: gene_name, gene_id, transcript_type), must contain a column \code{transcript_id} compatible with \code{names(annotations$transcripts)}}
 
