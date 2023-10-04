@@ -1,7 +1,8 @@
 ---
 title: "BilbORF: streamlined differential ORF usage analysis"
 author: Joanna A. Krupka
-output: rmarkdown::html_vignette
+date: "`r BiocStyle::doc_date()`"
+output: BiocStyle::html_document
 vignette: >
   %\VignetteIndexEntry{core_workflow}
   %\VignetteEngine{knitr::rmarkdown}
@@ -23,103 +24,124 @@ The ability of new sequencing techniques, such as Ribo-Seq, to map the position 
 To characterize the novel proteins correctly, we need a toolkit for accurate annotations. 
 If we annotate these ORFs with incorrect transcripts, then further analyses may be invalid.
 
+This vignette will walk you through the core package usage with examples.
 
 ```{r out.width = '70%', echo = FALSE}
 knitr::include_graphics("img/orf_translation_splicing.png")
 ```
 
-# Prerequisites 
+# Workflow
 
-```{r setup}
+`BilbORF` package currently supports the following analyses:
+- Identifying ORF translation status depending on the transcript isoform
+- Quantify P-sites abundance and frame preference for each ORF isoform (bulk analysis, not isoform specific)
+- Identifying changes in ORF usage coupled with differential transcript usage
+
+## Prerequisites
+
+Load libraries we need for examples:
+
+```{r setup, message=F}
 library(BilbORF)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(GenomicFeatures)
+library(rtracklayer)
+library(dplyr)
 ```
 
-# Workflow 
+### Prepare annotation
 
-## Prepare annotation
+Now use a wrapper to prepare annotations from GTF file. The main function, `prepare_annotations_fromGTF`, extracts transcript isoform models from the GTF file and returns them as a GRangesList object. The function builds transcript models using the `makeTxDbFromGFF` function from the `GenomicFeatures` package, checks the sequence levels of the `txdb` object against the provided `BSgenome` object, and extracts exons by transcripts and stores them in a list.
 
 ```{r annotations}
-library(BSgenome.Hsapiens.UCSC.hg38)
-
+# Load reference
 BSgenome <- BSgenome.Hsapiens.UCSC.hg38
-gtf <- "inst/extdata/gencode.v35.annotation_chr10.gtf"
+gtf <- system.file("extdata", "gencode.v35.annotation_chr10.gtf", package = "BilbORF")
 
 # Prepare annotations
 annotations <- prepare_annotations_fromGTF(gtf, BSgenome)
-str(annotations)
 ```
 
-## Identify ORF translation status depending on ORFs
+## Identify ORF translation status depending on the transcript isoform
+
+Next, we will annotate ORFs with their respective status in relation to overlapping transcripts. The workflow uses genomic annotations, ORF coordinates, and transcript metadata to achieve this.
+
+As an example, we will use a [consensus set of Ribo-seq ORFs](https://www.gencodegenes.org/pages/riboseq_orfs/) identified by seven recent experimental publications mapped to GENCODE version 35 annotations. A BED file containing ORF start and stop coordinates of ORFs found in chromosome 10 is provided in the package. This can be replaced with your own ORF coordinates obtained from any other ORF caller. 
+
+The ORF BED file must contain the following fields:
+- **chrom**: name of the chromosome or scaffold compatibile with the annotations provided.  
+- **chromStart**: position of the start codon (for ORFs on the positive strand) or stop codon (for ORFs on the negative strand)   
+- **chromEnd**: position of the stop codon (for ORFs on the positive strand) or start codon (for ORFs on the negative strand)   
+- **name**: name with a unique ORF identifier.  
+- **strand**: strand where an ORF was identified   
+
+
+The other fields are optional. ORF BED file should be loaded as a GRanges object, eg. with `rtracklayer::import`. 
+
+To aid isoforms interpretation, an extra metadata table with possible transcripts should be provided. It must contain a column `transcript_id` compatible with `names(annotations$transcripts)`. Here we consider the following extra columns: `transcript_type` (transcript biotype), `gene_name` and `gene_id`. 
+
+`annotate_orf_isoforms` will return a list containing two objects:  
+- table: A `tibble` with annotated ORF-transcript pairs.  
+- ranges: `GRangesList` with genomic coordinates of identified ORFs.  
+
+
+Available translation statuses:   
+- **translatable**: an ORF with valid start and stop codons with no internal stop codons, see `?annotate_orf_isoforms` for customizing which codons to consider as valid.  
+- **internal_stop**: untranslatable ORF with an internal stop codon.  
+- **no_stop_no_start**: untranslatable ORF without a valid start AND stop codon.  
+- **no_stop**: untranslatable ORF without a valid stop codon.  
+- **no_start**: untranslatable ORF withouth a valid start codon   
+
 
 ```{r orf_status}
-bed <- "inst/extdata/Ribo-seq_ORFs.bed"
+# Load ORFs
+bed <- system.file("extdata", "Ribo-seq_ORFs.bed", package = "BilbORF")
+orfs <- import(bed, format = "BED")
+names(orfs) <- orfs$name
+orf_tab <- as.data.frame(orfs)
 
 # Pull transcripts metadata
 transcripts_meta <- import(gtf, format = "GTF") %>%
   as.data.frame() %>%
   dplyr::filter(type == "transcript") %>%
-  dplyr::select(gene_name, transcript_id, transcript_type) %>%
-  distinct()
+  dplyr::select(gene_name, gene_id, transcript_id, transcript_type) %>%
+  dplyr::distinct()
 
-# Load ORFs
-orfs <- import(bed, format = "BED")
-names(orfs) <- orfs$name
-orf_tab <- as.data.frame(orfs)
 
 # Annotate ORF status on all overlapping transcripts 
 annotated_orfs <- annotate_orf_isoforms(annotations, orfs, BSgenome, transcripts_meta)
-head(annotated_orfs)
 ```
 
-## Quantify P-sites abundance and frame preference for each ORF  
+## Quantify P-sites abundance and frame preference for each ORF
 
-```{r}
-bam <- "inst/extdata/riboseq_chr10.bam"
+Next, we will quantify P-site abundance and frame preference for each ORF. This is done by counting the number of reads that map to each P-site position in the ORF. The function `count_p_sites` takes a BAM file, a data frame with offsets and a list of ORFs as input. The offsets data frame should contain two columns: `fraction` and `offsets_start`. The `fraction` column contains the read lengths to be counted at each P-site position. The `offsets_start` column contains the offset to be applied to estimate the P-site position. For example, if the `offsets_start` is -12, then the first P-site position will be 12 nucleotides upstream of the start codon. The offsets for each read length can be estimated automatically, for example using `detectRibosomeShifts` from the `ORFik` package. 
 
-offsets <- data.frame(fraction = c(25:30),
+The `count_p_sites` function will return a data frame containing computed metrics related to P-sites, entropy, and ORF scores per frame.
+
+```{r message=FALSE}
+# Get an example BAM file with Ribo-Seq reads
+bam <- system.file("extdata", "riboseq_chr10.bam", package = "BilbORF")
+
+# Define offsets
+offsets <- data.frame(fraction = 25:30,
                       offsets_start = -12) 
 
+# Quantify ORFs
 orf_translation <- count_p_sites(bam, offsets, annotated_orfs)
 ```
 
 ## Prepare differential transcript abundance results (example: DRIMSeq workflow)
 
-```{r}
+```{r message=FALSE}
 library(DRIMSeq)
 
-# Load data
-gtex_tx <- read_delim("inst/extdata/quantification_gencode.counts.txt")
-gtex_meta <- read_csv("inst/extdata/GTEx_longReads_Seq_meta.csv") %>%
-  dplyr::filter(sample_id %in% colnames(gtex_tx))
-
 # Pull transcript metadata
-transcripts_table <- read_csv("inst/extdata/gencode.v35.tx2gene.csv")
+transcripts_table <- read.csv(system.file("extdata", "gencode.v35.tx2gene.csv", package = "BilbORF"))
 transcripts_table <- transcripts_table %>%
   dplyr::mutate(transcript_ensembl_id = sapply(strsplit(transcript_id, "[.]"), function(x){x[1]}))
 
-# Prepare input for DRIMSeq
-meta <- gtex_meta %>%
-  dplyr::filter(tissue %in% c("Liver", "Lung")) %>%
-  mutate(group = factor(tissue),
-         label = sample_id) %>%
-  group_by(group) %>%
-  mutate(sample_id = paste(group, 1:length(group), sep = "_"))  %>%
-  as.data.frame() 
-
-counts <- gtex_tx %>%
-  dplyr::select(transcript, any_of(meta$label)) %>%
-  rename(feature_id = transcript) %>%
-  mutate(feature_id = sapply(strsplit(feature_id, "[.]"), function(x){x[1]})) %>%
-  left_join(dplyr::select(transcripts_table, gene_id, transcript_ensembl_id),
-            by = c("feature_id" = "transcript_ensembl_id")) %>%
-  relocate(gene_id) %>%
-  mutate(feature_id = make.unique(feature_id)) %>%
-  as.data.frame() %>%
-  dplyr::filter(!is.na(gene_id))
-colnames(counts)[-1:-2] <- meta$sample_id
-
 # Differential transcript usage
-d <- dmDSdata(counts = counts, samples = meta)
+d <- dmDSdata(counts = gtex_data$counts, samples = gtex_data$meta)
 d <- dmFilter(d, min_samps_gene_expr = 7, min_samps_feature_expr = 3,
               min_gene_expr = 10, min_feature_expr = 10)
 design_full <- model.matrix(~ group, data = samples(d))
@@ -132,32 +154,114 @@ d <- dmTest(d, coef = "groupLung", verbose = 1)
 # Tidy results
 dtu_results <- results(d, level = "feature") %>%
   left_join(proportions(d)) %>%
-  mutate(mean_lung = rowMeans(dplyr::select(., starts_with("Lung")), na.rm = TRUE),
+  dplyr::mutate(mean_lung = rowMeans(dplyr::select(., starts_with("Lung")), na.rm = TRUE),
          mean_liver = rowMeans(dplyr::select(., starts_with("Liver")), na.rm = TRUE),
          log2FoldChange = log2(mean_lung/mean_liver)) %>%
   dplyr::rename(transcript_id = feature_id) %>%
-  arrange(adj_pvalue) %>%
-  left_join(dplyr::select(transcripts_table, transcript_ensembl_id, gene_name), 
+  dplyr::arrange(adj_pvalue) %>%
+  dplyr::left_join(dplyr::select(transcripts_table, transcript_ensembl_id, gene_name), 
             by = c("transcript_id" = "transcript_ensembl_id")) %>%
-  relocate(gene_name, gene_id, transcript_id, pvalue, adj_pvalue, mean_lung, mean_liver, log2.FC) 
-
-# Save results
-write_csv(dtu_results, file = "inst/extdata/DRIMSeq_lung_liver_GTEx_longReads_Seq.csv")
+  dplyr::relocate(gene_name, gene_id, transcript_id, pvalue, adj_pvalue, mean_lung, mean_liver, log2FoldChange) 
 ```
 
-## Identify events of differential ORF usage
+## Identify events of differential ORF usage (experimental)
 
-```{r}
-dtu_results <- read_csv("inst/extdata/DRIMSeq_lung_liver_GTEx_longReads_Seq.csv")
+The function `diff_orf_usage` will correlate the differential transcript usage events with possible changes in ORF translation. For now, only qualiative changes are supported, for example ORF gain, loss or switch. 
+
+```{r message=FALSE}
 dtu_results <- dtu_results %>%
   mutate(rank = log2FoldChange)
 
+annotated_orfs_tab <- annotated_orfs$table %>%
+  mutate(transcript_id = sapply(strsplit(transcript_id, "[.]"), 
+                                            function(x){x[1]}))
+  
 selected_genes <- dtu_results %>%
-  mutate(hasORF = transcript_id %in% sapply(strsplit(annotated_orfs$table$transcript_id, "[.]"), 
-                                            function(x){x[1]})) %>%
-  group_by()
+  mutate(hasORF = transcript_id %in% annotated_orfs_tab$transcript_id) %>%
+  dplyr::filter(hasORF & adj_pvalue < 0.05)
+selected_genes <- unique(selected_genes$gene_id)
+
+orf_landscape <- diff_orf_usage(annotated_orfs_tab, dtu_results, selected_genes)
+```
+
+## Visualisations 
+
+```{r message=FALSE}
+library(ComplexHeatmap)
+library(circlize)
+library(tidyverse)
+
+# Selected genes heatmap 
+gene_stats <- orf_landscape$gene_stats
+mat_unscaled <- as.tibble(gene_stats) %>%
+  dplyr::select(-gene_id) %>%
+  column_to_rownames("gene_name")
+mat <- scale(mat_unscaled)
+
+# Graphics
+col_fun <- colorRamp2(c(-2, 0, 2), rev(c("#4D004B", "#8C96C6", "#9EBCDA")))
+col_fun(seq(-3, 3))
+
+# Heatmap
+Heatmap(mat,
+        cluster_rows = F,
+        cluster_columns = F,
+        col = col_fun,
+        rect_gp = gpar(col = "white", lwd = 2),
+        cell_fun = function(j, i, x, y, w, h, col) {
+          grid.text(round(mat_unscaled[i, j], 2), x, y, gp = gpar(col = "white")) # Set text color to white
+        })
+
+# Examples: NUTM2B-AS1 and ADK
+examples <- c("ENSG00000225484.7", "ENSG00000156110.14")
+col_dtu <-  colorRamp2(c(-2, 0, 2), c("#225EA8", "white", "#E31A1C"))
+col_orf <-  structure(c("#4D004B", "#8C6BB1", "#D4B9DA", "#8C96C6", "#9EBCDA","#BFD3E6", "grey"),
+                    names = c("translatable_1", "translatable_2", "internal_stop", "no_stop_no_start", "no_stop", "orf_loss"))
+
+for (e in seq_along(examples)){
+  gene_tab <- orf_landscape$gene_tables[[examples[e]]]
+  gene_name <- gene_stats$gene_name[gene_stats$gene_id == examples[e]]
+  
+  dtu_results <- as.tibble(gene_tab) %>%
+    dplyr::select(transcript_id, rank) %>%
+    column_to_rownames("transcript_id")
+  dtu_results <- as.matrix(dtu_results)
+  
+  orf_tab <- as.tibble(gene_tab) %>%
+    column_to_rownames("transcript_id") %>%
+    dplyr::select(-adj_pvalue, -rank) 
+  orf_tab <- as.matrix(orf_tab)  
+  
+  dtu_heatmap <- Heatmap(dtu_results, 
+               name = "DTU",
+               col = col_dtu,
+               cluster_columns = F,
+               cluster_rows = F,
+               row_title_gp = gpar(fontsize = 8),
+               show_row_names = T, 
+               row_names_side = "left",  
+               border = TRUE,
+               border_gp = gpar(col = "#838383", lwd = 0.5))
+  
+  orf <- Heatmap(orf_tab, 
+               name = "ORFs",
+               col = col_orf, 
+               cluster_rows = F, 
+               cluster_columns = T,
+               row_title_gp = gpar(fontsize = 8),
+               show_row_names = F,
+               rect_gp = gpar(col = "white", lwd = 1),
+               height = unit(3, "cm"))
+  
+  ht_list <- dtu_heatmap + orf
+  
+  draw(ht_list, column_title = gene_name)
+  
+}
 
 
+```
 
-
+```{r}
+sessionInfo()
 ```

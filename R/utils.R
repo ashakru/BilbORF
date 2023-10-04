@@ -49,6 +49,19 @@ rank_exons <- function(grl){
 
 }
 
+get_all_orfs <- function(gene_id, annotated_orfs_tab){
+  annotated_orfs_tab[annotated_orfs_tab$gene_id == gene_id,]
+}
+
+get_orf_isoform_matrices <- function(dtu_results_filtered, annotated_orfs_tab){
+
+  # DTU vector
+  dtu <- dtu_results_filtered %>%
+    dplyr::select()
+
+}
+
+
 #### Draft functions for Kozak sequence score calculation
 simplify_grl <- function(grl){
 
