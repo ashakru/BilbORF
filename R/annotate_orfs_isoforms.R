@@ -1,7 +1,7 @@
 #' Annotate ORF with their status respective of
 #'
 #' @param annotations List with genomic annotations, output of `prepare_annotations()`
-#' @param orfs GRanges or GRangesList with genomic coordinates of ORFs of interest
+#' @param orfs GRanges or GRangesList with genomic coordinates of the start and stop codons for ORFs of interest
 #' @param transcript_meta (optional) A data.frame with transcript metadata (for example: gene_name, gene_id, transcript_type), must contain a column `transcript_id` compatible with `names(annotations$transcripts)`
 #' @param orfs_meta (optional) A data.frame with ORF metadata, must contain a column `ORF_id` compatible with `names(orfs)`
 #' @param start_codons A vector with codons recognized as start codon; default `c("ATG","TTG","CTG","GTG")`

@@ -1,7 +1,8 @@
 ---
 title: "BilbORF: streamlined differential ORF usage analysis"
 author: Joanna A. Krupka
-output: rmarkdown::html_vignette
+date: "`r BiocStyle::doc_date()`"
+output: BiocStyle::html_document
 vignette: >
   %\VignetteIndexEntry{core_workflow}
   %\VignetteEngine{knitr::rmarkdown}
@@ -23,36 +24,81 @@ The ability of new sequencing techniques, such as Ribo-Seq, to map the position 
 To characterize the novel proteins correctly, we need a toolkit for accurate annotations. 
 If we annotate these ORFs with incorrect transcripts, then further analyses may be invalid.
 
+This vignette will walk you through the core package usage with examples.
 
 ```{r out.width = '70%', echo = FALSE}
 knitr::include_graphics("img/orf_translation_splicing.png")
 ```
 
-# Prerequisites 
+# Workflow
 
-```{r setup}
+`BilbORF` package currently supports the following analyses:
+- Identifying ORF translation status depending on the transcript isoform
+- Quantify P-sites abundance and frame preference for each ORF isoform (bulk analysis, not isoform specific)
+- Identifying changes in ORF usage coupled with differential transcript usage
+
+## Prerequisites
+
+Load libraries we need for examples:
+
+```{r setup, message=F}
 library(BilbORF)
+library(BSgenome.Hsapiens.UCSC.hg38)
+library(GenomicFeatures)
+library(rtracklayer)
+library(dplyr)
 ```
 
-# Workflow 
+### Prepare annotation
 
-## Prepare annotation
+Now use a wrapper to prepare annotations from GTF file. The main function, `prepare_annotations_fromGTF`, extracts transcript isoform models from the GTF file and returns them as a GRangesList object. The function builds transcript models using the `makeTxDbFromGFF` function from the `GenomicFeatures` package, checks the sequence levels of the `txdb` object against the provided `BSgenome` object, and extracts exons by transcripts and stores them in a list.
 
 ```{r annotations}
-library(BSgenome.Hsapiens.UCSC.hg38)
-
+# Load reference
 BSgenome <- BSgenome.Hsapiens.UCSC.hg38
 gtf <- system.file("extdata", "gencode.v35.annotation_chr10.gtf", package = "BilbORF")
 
 # Prepare annotations
 annotations <- prepare_annotations_fromGTF(gtf, BSgenome)
-str(annotations)
 ```
 
-## Identify ORF translation status depending on ORFs
+## Identify ORF translation status depending on the transcript isoform
+
+Next, we will annotate ORFs with their respective status in relation to overlapping transcripts. The workflow uses genomic annotations, ORF coordinates, and transcript metadata to achieve this.
+
+As an example, we will use a [consensus set of Ribo-seq ORFs](https://www.gencodegenes.org/pages/riboseq_orfs/) identified by seven recent experimental publications mapped to GENCODE version 35 annotations. A BED file containing ORF start and stop coordinates of ORFs found in chromosome 10 is provided in the package. This can be replaced with your own ORF coordinates obtained from any other ORF caller. 
+
+The ORF BED file must contain the following fields:
+- **chrom**: name of the chromosome or scaffold compatibile with the annotations provided.  
+- **chromStart**: position of the start codon (for ORFs on the positive strand) or stop codon (for ORFs on the negative strand)   
+- **chromEnd**: position of the stop codon (for ORFs on the positive strand) or start codon (for ORFs on the negative strand)   
+- **name**: name with a unique ORF identifier.  
+- **strand**: strand where an ORF was identified   
+
+
+The other fields are optional. ORF BED file should be loaded as a GRanges object, eg. with `rtracklayer::import`. 
+
+To aid isoforms interpretation, an extra metadata table with possible transcripts should be provided. It must contain a column `transcript_id` compatible with `names(annotations$transcripts)`. Here we consider the following extra columns: `transcript_type` (transcript biotype), `gene_name` and `gene_id`. 
+
+`annotate_orf_isoforms` will return a list containing two objects:  
+- table: A `tibble` with annotated ORF-transcript pairs.  
+- ranges: `GRangesList` with genomic coordinates of identified ORFs.  
+
+
+Available translation statuses:   
+- **translatable**: an ORF with valid start and stop codons with no internal stop codons, see `?annotate_orf_isoforms` for customizing which codons to consider as valid.  
+- **internal_stop**: untranslatable ORF with an internal stop codon.  
+- **no_stop_no_start**: untranslatable ORF without a valid start AND stop codon.  
+- **no_stop**: untranslatable ORF without a valid stop codon.  
+- **no_start**: untranslatable ORF withouth a valid start codon   
+
 
 ```{r orf_status}
+# Load ORFs
 bed <- system.file("extdata", "Ribo-seq_ORFs.bed", package = "BilbORF")
+orfs <- import(bed, format = "BED")
+names(orfs) <- orfs$name
+orf_tab <- as.data.frame(orfs)
 
 # Pull transcripts metadata
 transcripts_meta <- import(gtf, format = "GTF") %>%
@@ -61,34 +107,33 @@ transcripts_meta <- import(gtf, format = "GTF") %>%
   dplyr::select(gene_name, gene_id, transcript_id, transcript_type) %>%
   dplyr::distinct()
 
-# Load ORFs
-orfs <- import(bed, format = "BED")
-names(orfs) <- orfs$name
-orf_tab <- as.data.frame(orfs)
 
 # Annotate ORF status on all overlapping transcripts 
 annotated_orfs <- annotate_orf_isoforms(annotations, orfs, BSgenome, transcripts_meta)
-head(annotated_orfs)
 ```
 
-## Quantify P-sites abundance and frame preference for each ORF  
+## Quantify P-sites abundance and frame preference for each ORF
 
-```{r}
+Next, we will quantify P-site abundance and frame preference for each ORF. This is done by counting the number of reads that map to each P-site position in the ORF. The function `count_p_sites` takes a BAM file, a data frame with offsets and a list of ORFs as input. The offsets data frame should contain two columns: `fraction` and `offsets_start`. The `fraction` column contains the read lengths to be counted at each P-site position. The `offsets_start` column contains the offset to be applied to estimate the P-site position. For example, if the `offsets_start` is -12, then the first P-site position will be 12 nucleotides upstream of the start codon. The offsets for each read length can be estimated automatically, for example using `detectRibosomeShifts` from the `ORFik` package. 
+
+The `count_p_sites` function will return a data frame containing computed metrics related to P-sites, entropy, and ORF scores per frame.
+
+```{r message=FALSE}
+# Get an example BAM file with Ribo-Seq reads
 bam <- system.file("extdata", "riboseq_chr10.bam", package = "BilbORF")
 
+# Define offsets
 offsets <- data.frame(fraction = 25:30,
                       offsets_start = -12) 
 
+# Quantify ORFs
 orf_translation <- count_p_sites(bam, offsets, annotated_orfs)
 ```
 
 ## Prepare differential transcript abundance results (example: DRIMSeq workflow)
 
-```{r}
+```{r message=FALSE}
 library(DRIMSeq)
-
-# Overview of dataset used in this package
-str(gtex_data)
 
 # Pull transcript metadata
 transcripts_table <- read.csv(system.file("extdata", "gencode.v35.tx2gene.csv", package = "BilbORF"))
@@ -119,9 +164,11 @@ dtu_results <- results(d, level = "feature") %>%
   dplyr::relocate(gene_name, gene_id, transcript_id, pvalue, adj_pvalue, mean_lung, mean_liver, log2FoldChange) 
 ```
 
-## Identify events of differential ORF usage
+## Identify events of differential ORF usage (experimental)
 
-```{r}
+The function `diff_orf_usage` will correlate the differential transcript usage events with possible changes in ORF translation. For now, only qualiative changes are supported, for example ORF gain, loss or switch. 
+
+```{r message=FALSE}
 dtu_results <- dtu_results %>%
   mutate(rank = log2FoldChange)
 
@@ -139,7 +186,7 @@ orf_landscape <- diff_orf_usage(annotated_orfs_tab, dtu_results, selected_genes)
 
 ## Visualisations 
 
-```{r}
+```{r message=FALSE}
 library(ComplexHeatmap)
 library(circlize)
 library(tidyverse)
@@ -162,7 +209,7 @@ Heatmap(mat,
         col = col_fun,
         rect_gp = gpar(col = "white", lwd = 2),
         cell_fun = function(j, i, x, y, w, h, col) {
-          grid.text(mat[i, j], x, y, gp = gpar(col = "white")) # Set text color to white
+          grid.text(round(mat_unscaled[i, j], 2), x, y, gp = gpar(col = "white")) # Set text color to white
         })
 
 # Examples: NUTM2B-AS1 and ADK
@@ -173,7 +220,6 @@ col_orf <-  structure(c("#4D004B", "#8C6BB1", "#D4B9DA", "#8C96C6", "#9EBCDA","#
 
 for (e in seq_along(examples)){
   gene_tab <- orf_landscape$gene_tables[[examples[e]]]
-  print(gene_tab)
   gene_name <- gene_stats$gene_name[gene_stats$gene_id == examples[e]]
   
   dtu_results <- as.tibble(gene_tab) %>%
@@ -216,4 +262,6 @@ for (e in seq_along(examples)){
 
 ```
 
+```{r}
+sessionInfo()
 ```
