@@ -2,7 +2,7 @@
 % Please edit documentation in R/diff_orf_usage.R
 \name{diff_orf_usage}
 \alias{diff_orf_usage}
-\title{Calculate Differential ORF Usage}
+\title{Analyze Differential ORF Usage from Transcript Isoform Changes}
 \usage{
 diff_orf_usage(
   annotated_orfs_tab,
@@ -12,26 +12,149 @@ diff_orf_usage(
 )
 }
 \arguments{
-\item{annotated_orfs_tab}{A data frame containing information about annotated ORFs.}
+\item{annotated_orfs_tab}{Data frame from \code{annotate_orf_isoforms()$table}
+containing ORF-transcript annotations. Must include columns: ORF_id,
+transcript_id, gene_id, unique_tx_iso.}
 
-\item{dtu_results}{A data frame containing results of differential transcript usage analysis.}
+\item{dtu_results}{Data frame with differential transcript usage results.
+Required columns:
+\describe{
+\item{transcript_id}{Transcript identifiers matching annotated_orfs_tab}
+\item{gene_id}{Gene identifiers}
+\item{gene_name}{Gene symbols for labeling}
+\item{pvalue}{Statistical significance of DTU}
+\item{adj_pvalue}{Adjusted p-value (e.g., from multiple testing correction)}
+\item{rank}{Numeric ranking metric (e.g., log2FoldChange or ΔUsage)}
+}
+Typically from DRIMSeq, DEXSeq, or similar DTU tools.}
 
-\item{selected_genes}{A character vector of gene IDs for which differential ORF usage will be calculated.}
+\item{selected_genes}{Character vector of gene IDs to analyze. Usually
+genes with significant DTU events and detectable ORFs.}
 
-\item{orf_translation}{(optional) A data frame containing ORF translations.}
+\item{orf_translation}{Optional data frame with ORF translation metrics
+from \code{\link{count_p_sites}}. Currently not used in calculations
+but reserved for future quantitative analysis.}
 }
 \value{
-A list containing two elements: 'gene_stats' and 'gene_tables'.
+A list with two elements:
+\describe{
+\item{gene_stats}{Data frame with one row per gene, sorted by n_events
+(descending). Columns:
 \itemize{
-\item 'gene_stats': A data frame with statistics about the differential ORF usage for each gene.
-\item 'gene_tables': A list of data tables, each containing the ORF/isoform combinations for a specific gene.
+\item gene_id, gene_name: Gene identifiers
+\item n_tx_isoforms: Number of transcript isoforms for this gene
+\item n_signif_dtu: Count of isoforms with adj_pvalue < 0.05
+\item n_orfs: Number of distinct ORFs overlapping this gene
+\item n_events: Total ORF-isoform combinations (potential translation events)
+\item n_translatable: Count of translatable ORF-isoform pairs
+}}
+\item{gene_tables}{Named list of data.tables, one per gene. Each table
+is a matrix with:
+\itemize{
+\item Rows: Transcript isoforms (with adj_pvalue, rank metadata)
+\item Columns: ORFs
+\item Values: Translation status (e.g., "translatable_1", "internal_stop",
+"orf_loss" if ORF doesn't overlap that isoform)
+}}
 }
 }
 \description{
-This function calculates differential ORF usage based on the provided inputs.
+Links differential transcript usage (DTU) results to changes in ORF translation
+status. Creates matrices showing which ORFs are gained, lost, or switched
+between translatable and non-translatable states across isoform changes.
+}
+\details{
+\strong{Analysis Strategy:}
+For each gene, the function constructs a matrix showing the fate of each ORF
+across all transcript isoforms. This reveals:
+\itemize{
+\item \strong{ORF gain/loss}: ORFs present in some isoforms but not others
+\item \strong{Status switches}: ORFs changing between translatable and
+non-translatable due to isoform-specific sequences
+\item \strong{Protein isoform diversity}: Multiple translatable ORF states
+producing different protein products
+}
+
+The \code{unique_tx_iso} column groups ORF-isoform pairs producing identical
+amino acid sequences, helping identify truly distinct protein products.
+
+\strong{Typical Workflow:}
+\enumerate{
+\item Perform DTU analysis (e.g., with DRIMSeq)
+\item Annotate ORFs with \code{annotate_orf_isoforms()}
+\item Filter to genes with significant DTU and detected ORFs
+\item Run \code{diff_orf_usage()} to link isoform changes to ORF changes
+\item Visualize results with heatmaps (see vignette)
+}
+}
+\note{
+This function provides qualitative analysis of ORF status changes.
+Quantitative changes in ORF abundance require combining with Ribo-seq
+data and isoform quantification.
 }
 \examples{
-# Example Usage
-diff_orf_usage(annotated_orfs_tab, dtu_results, selected_genes)
+\dontrun{
+# Typical workflow
+library(DRIMSeq)
+library(BilbORF)
 
+# 1. Perform DTU analysis
+d <- dmDSdata(counts = counts, samples = samples)
+d <- dmFilter(d)
+d <- dmPrecision(d, design = design)
+d <- dmFit(d, design = design)
+d <- dmTest(d, coef = "condition")
+
+# 2. Format DTU results
+dtu_results <- results(d, level = "feature") \%>\%
+  mutate(rank = log2FoldChange) # or another ranking metric
+
+# 3. Annotate ORFs (see ?annotate_orf_isoforms)
+annotated_orfs <- annotate_orf_isoforms(...)
+
+# 4. Select genes with significant DTU and ORFs
+selected_genes <- dtu_results \%>\%
+  filter(adj_pvalue < 0.05,
+         transcript_id \%in\% annotated_orfs$table$transcript_id) \%>\%
+  pull(gene_id) \%>\%
+  unique()
+
+# 5. Analyze differential ORF usage
+orf_landscape <- diff_orf_usage(
+  annotated_orfs$table,
+  dtu_results,
+  selected_genes
+)
+
+# 6. Explore results
+head(orf_landscape$gene_stats)
+orf_landscape$gene_tables[[1]]  # Matrix for first gene
+}
+
+# Simple example with mock data
+orf_tab <- data.frame(
+  ORF_id = c("orf1", "orf1", "orf2"),
+  transcript_id = c("tx1", "tx2", "tx1"),
+  gene_id = c("gene1", "gene1", "gene1"),
+  unique_tx_iso = c("translatable_1", "internal_stop", "translatable_1")
+)
+
+dtu_results <- data.frame(
+  transcript_id = c("tx1", "tx2"),
+  gene_id = c("gene1", "gene1"),
+  gene_name = c("GENEA", "GENEA"),
+  pvalue = c(0.01, 0.05),
+  adj_pvalue = c(0.02, 0.08),
+  rank = c(-1.5, 2.0)
+)
+
+results <- diff_orf_usage(orf_tab, dtu_results, "gene1")
+print(results$gene_stats)
+print(results$gene_tables$gene1)
+
+}
+\seealso{
+\code{\link{annotate_orf_isoforms}} for preparing ORF input
+\code{DRIMSeq}, \code{DEXSeq} for DTU analysis
+Vignette \code{vignette("core_workflow", package = "BilbORF")} for visualization
 }

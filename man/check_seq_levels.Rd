@@ -2,17 +2,28 @@
 % Please edit documentation in R/utils.R
 \name{check_seq_levels}
 \alias{check_seq_levels}
-\title{Title}
+\title{Check Sequence Level Compatibility Between Genomic Objects}
 \usage{
 check_seq_levels(x, y)
 }
 \arguments{
-\item{x, y}{The object from/on which to get/set the seqlevels and seqlevels style}
+\item{x, y}{Genomic objects with sequence levels (e.g., TxDb, BSgenome, GRanges).
+Must support \\code{seqlevelsStyle()} and \\code{seqlevels()} methods from
+GenomeInfoDb.}
+}
+\value{
+NULL (invisibly). Function is called for side effects (error on mismatch).
 }
 \description{
-Title
+Validates that two genomic objects (e.g., TxDb and BSgenome) have compatible
+sequence levels and naming styles. This prevents mismatches between chromosome
+naming conventions (e.g., "chr1" vs "1").
+}
+\details{
+The function checks:\n#' \\enumerate{\n#'   \\item \\strong{Sequence style}: Ensures both objects use the same naming\n#'     convention (UCSC: \"chr1\", Ensembl: \"1\", NCBI: \"NC_000001.11\", etc.)\n#'   \\item \\strong{Sequence names}: Verifies that sequence names are compatible\n#'     (though exact match is not required)\n#' }\n#'
+Common mismatches occur when mixing:\n#' \\itemize{\n#'   \\item UCSC genome (BSgenome.Hsapiens.UCSC.hg38) with Ensembl GTF\n#'   \\item Chromosome-only GTF with whole-genome alignment including contigs\n#' }\n#'
 }
 \examples{
-check_seq_levels(Granges_1, Granges_2)
+\\dontrun{\n#' library(BSgenome.Hsapiens.UCSC.hg38)\n#' library(GenomicFeatures)\n#' \n#' # Load GTF and genome\n#' txdb <- makeTxDbFromGFF(\"gencode.gtf\")\n#' genome <- BSgenome.Hsapiens.UCSC.hg38\n#' \n#' # Check compatibility (will error if incompatible)\n#' check_seq_levels(txdb, genome)\n#' }\n#'\n#' @seealso \\code{GenomeInfoDb::seqlevelsStyle} for viewing/converting styles
 }
 \keyword{internal}

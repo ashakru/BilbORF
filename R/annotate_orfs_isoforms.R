@@ -1,38 +1,144 @@
-#' Annotate ORF with their status respective of
+#' Annotate ORFs with Translation Status Across Transcript Isoforms
 #'
-#' @param annotations List with genomic annotations, output of `prepare_annotations()`
-#' @param orfs GRanges or GRangesList with genomic coordinates of the start and stop codons for ORFs of interest
-#' @param transcript_meta (optional) A data.frame with transcript metadata (for example: gene_name, gene_id, transcript_type), must contain a column `transcript_id` compatible with `names(annotations$transcripts)`
-#' @param orfs_meta (optional) A data.frame with ORF metadata, must contain a column `ORF_id` compatible with `names(orfs)`
-#' @param start_codons A vector with codons recognized as start codon; default `c("ATG","TTG","CTG","GTG")`
-#' @param stop_codons A vector with codons recognized as stop codon; default `c("TAG", "TAA", "TGA")`
+#' Maps Open Reading Frames (ORFs) to overlapping transcript isoforms and
+#' determines their translation competency by analyzing start codons, stop codons,
+#' and internal stops. Each ORF-transcript pair is evaluated independently.
 #'
-#' @return A list containing a table with annotated ORF-transcript pairs (`$table`) and GRangesList with genomic coordinates of identified ORFs (`$ranges`)
+#' @param annotations List containing genomic annotations, as returned by
+#'   \code{\link{prepare_annotations_fromGTF}}. Must contain a \code{transcripts}
+#'   element with transcript models as a GRangesList.
+#' @param orfs GRanges or GRangesList with genomic coordinates of ORF start and
+#'   stop codons. For GRanges input, ranges will be grouped by name. Each ORF
+#'   can span multiple exons (for spliced ORFs).
+#' @param BSgenome A BSgenome object matching the genome build used for annotations.
+#'   Required for extracting ORF nucleotide sequences.
+#' @param transcript_meta A data.frame with transcript metadata. Must contain
+#'   a \code{transcript_id} column matching \code{names(annotations$transcripts)}.
+#'   Commonly includes: gene_name, gene_id, transcript_type. This information
+#'   is joined to the output table.
+#' @param orfs_meta Optional data.frame with ORF metadata. Must contain an
+#'   \code{ORF_id} column matching ORF names. Additional columns are joined
+#'   to the output.
+#' @param start_codons Character vector of valid start codons. Default is
+#'   \code{c("ATG","TTG","CTG","GTG")} covering canonical and alternative starts.
+#' @param stop_codons Character vector of valid stop codons. Default is
+#'   \code{c("TAG", "TAA", "TGA")} covering all standard stop codons.
+#'
+#' @return A list with two elements:
+#'   \describe{
+#'     \item{table}{A data.frame (tibble) with one row per ORF-transcript pair.
+#'       Key columns include:
+#'       \itemize{
+#'         \item \code{ORF_isoform_id}: Unique identifier for ORF-transcript pair
+#'         \item \code{ORF_id}: Original ORF identifier
+#'         \item \code{transcript_id}: Overlapping transcript ID
+#'         \item \code{gene_id}, \code{gene_name}: Gene annotations
+#'         \item \code{seq_nt}: Nucleotide sequence of the ORF in this isoform
+#'         \item \code{seq_aa}: Translated amino acid sequence
+#'         \item \code{start_codon}, \code{stop_codon}: First and last codons
+#'         \item \code{orf_status}: Translation status (see Details)
+#'         \item \code{unique_tx_iso}: Groups isoforms producing identical proteins
+#'       }}
+#'     \item{ranges}{A GRangesList with genomic coordinates of ORF-transcript
+#'       intersections, representing the actual translated regions.}
+#'   }
+#'
+#' @details
+#' \strong{ORF Status Categories:}
+#' \describe{
+#'   \item{translatable}{Valid start and stop codons present, no internal stops.
+#'     The ORF can produce a full-length protein in this isoform.}
+#'   \item{internal_stop}{Contains one or more stop codons before the final
+#'     position. Translation would terminate prematurely.}
+#'   \item{no_stop}{Missing a valid stop codon at the 3' end. ORF extends to
+#'     transcript terminus without proper termination.}
+#'   \item{no_start}{Missing a valid start codon at the 5' end but has a stop.
+#'     Cannot initiate translation properly.}
+#'   \item{no_stop_no_start}{Missing both valid start and stop codons.}
+#' }
+#'
+#' \strong{Algorithm Overview:}
+#' \enumerate{
+#'   \item Find overlaps between ORFs and transcripts
+#'   \item Calculate spliced intersections (ORF coordinates within each transcript)
+#'   \item Extract and translate sequences
+#'   \item Classify translation status
+#'   \item Group isoforms producing identical proteins
+#' }
+#'
+#' @note ORF coordinates should represent the complete ORF boundaries (start to
+#'   stop codon), not just the coding sequence. For multi-exon ORFs, provide
+#'   all exonic segments.
+#'
 #' @import ORFik
 #' @import tibble
 #' @importFrom GenomicFeatures extractTranscriptSeqs
 #' @importFrom dplyr mutate case_when left_join group_by relocate
 #' @export
+#'
 #' @examples
-#' BSgenome <- BSgenome.Hsapiens.UCSC.hg38
-#' gtf <- "inst/extdata/gencode.v35.annotation_chr10.gtf"
-#' bed <- "inst/extdata/Ribo-seq_ORFs.bed"
-#'
+#' \dontrun{
+#' library(BSgenome.Hsapiens.UCSC.hg38)
+#' library(rtracklayer)
+#' 
 #' # Prepare annotations
-#' annotations <- prepare_annotations_fromGTF(gtf, BSgenome)
-#'
-#' # Pull transcripts metadata
+#' gtf <- "path/to/annotation.gtf"
+#' annotations <- prepare_annotations_fromGTF(gtf, BSgenome.Hsapiens.UCSC.hg38)
+#' 
+#' # Load ORFs from BED file
+#' orfs <- import("path/to/orfs.bed", format = "BED")
+#' names(orfs) <- orfs$name
+#' 
+#' # Prepare transcript metadata
 #' transcripts_meta <- import(gtf, format = "GTF") %>%
 #'   as.data.frame() %>%
-#'   dplyr::filter(type == "transcript") %>%
-#'   dplyr::select(gene_name, transcript_id, transcript_type) %>%
+#'   filter(type == "transcript") %>%
+#'   select(gene_name, gene_id, transcript_id, transcript_type) %>%
 #'   distinct()
+#' 
+#' # Annotate ORFs
+#' result <- annotate_orf_isoforms(
+#'   annotations, 
+#'   orfs, 
+#'   BSgenome.Hsapiens.UCSC.hg38,
+#'   transcripts_meta
+#' )
+#' 
+#' # Explore results
+#' table(result$table$orf_status)
+#' head(result$table)
+#' }
+#' 
+#' # Using package example data
+#' gtf <- system.file("extdata", "gencode.v35.annotation_chr10.gtf", 
+#'                    package = "BilbORF")
+#' bed <- system.file("extdata", "Ribo-seq_ORFs.bed", package = "BilbORF")
+#' 
+#' if (gtf != "" && bed != "") {
+#'   library(BSgenome.Hsapiens.UCSC.hg38)
+#'   library(rtracklayer)
+#'   
+#'   BSgenome <- BSgenome.Hsapiens.UCSC.hg38
+#'   annotations <- prepare_annotations_fromGTF(gtf, BSgenome)
+#'   orfs <- import(bed, format = "BED")
+#'   names(orfs) <- orfs$name
+#'   
+#'   transcripts_meta <- import(gtf, format = "GTF") %>%
+#'     as.data.frame() %>%
+#'     dplyr::filter(type == "transcript") %>%
+#'     dplyr::select(gene_name, gene_id, transcript_id, transcript_type) %>%
+#'     dplyr::distinct()
+#'   
+#'   annotated_orfs <- annotate_orf_isoforms(
+#'     annotations, orfs[1:5], BSgenome, transcripts_meta
+#'   )
+#'   
+#'   print(table(annotated_orfs$table$orf_status))
+#' }
 #'
-#' # Load ORFs
-#' orfs <- import(bed, format = "BED")
-#' names(orfs) <- orfs$name
-#' orf_tab <- as.data.frame(orfs)
-#' annotated_orfs <- annotate_orf_isoforms(annotations, orfs, BSgenome, transcripts_meta)
+#' @seealso 
+#' \code{\link{prepare_annotations_fromGTF}} for creating annotation input
+#' \code{\link{diff_orf_usage}} for differential usage analysis
 annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
                                   transcript_meta, orfs_meta = NULL,
                                   start_codons = c("ATG","TTG","CTG","GTG"),

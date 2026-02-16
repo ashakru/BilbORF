@@ -2,16 +2,59 @@
 % Please edit documentation in R/utils.R
 \name{rank_exons}
 \alias{rank_exons}
-\title{Function to assign appropriate exon ranking depending on the ranges strand}
+\title{Assign Strand-Aware Exon Ranks to Genomic Ranges}
 \usage{
 rank_exons(grl)
 }
 \arguments{
-\item{grl}{GRangesList object}
+\item{grl}{GRangesList where each element represents a transcript or ORF
+with multiple exons. Strand information must be present.}
 }
 \value{
-A list of genomic ranges objects with exon ranks assigned.
+A GRangesList with the same structure as input, but with an additional
+\\code{exon_rank} column in the metadata. Ranges are sorted by exon_rank
+within each element.
 }
 \description{
-Function to assign appropriate exon ranking depending on the ranges strand
+Adds exon rank metadata to each range in a GRangesList, with directionality
+based on strand. For positive strand, ranks 5' to 3' (1, 2, 3...). For
+negative strand, ranks 3' to 5' (reverse order) so exon rank 1 is always
+the 5'-most exon in transcript orientation.
+}
+\details{
+The function processes each element of the GRangesList independently:
+\\itemize{
+\\item \\strong{Positive strand (+)}: Ranks 1, 2, 3... following genomic
+coordinates (left to right)
+\\item \\strong{Negative strand (-)}: Ranks from highest to lowest coordinate
+so rank 1 is rightmost (which is 5' in transcript orientation)
+\\item \\strong{Unstranded (*)}: Treated as positive strand
+}
+
+This ensures exon rank 1 always refers to the first exon encountered during
+transcription/translation, regardless of strand.
+}
+\examples{
+library(GenomicRanges)
+
+# Positive strand transcript
+tx_pos <- GRanges(\"chr1\", 
+                  IRanges(c(100, 200, 300), c(150, 250, 350)),
+                  strand = \"+\")
+grl_pos <- GRangesList(gene1 = tx_pos)
+ranked_pos <- rank_exons(grl_pos)
+ranked_pos$gene1$exon_rank  # 1, 2, 3
+
+# Negative strand transcript
+tx_neg <- GRanges(\"chr1\",
+                  IRanges(c(100, 200, 300), c(150, 250, 350)),
+                  strand = \"-\")
+grl_neg <- GRangesList(gene1 = tx_neg)
+ranked_neg <- rank_exons(grl_neg)
+ranked_neg$gene1$exon_rank  # 3, 2, 1 (then sorted to 1, 2, 3 by position)
+start(ranked_neg$gene1)     # 300, 200, 100 (sorted by rank)
+
+}
+\seealso{
+\\code{\\link{annotate_orf_isoforms}} which uses this function internally
 }
