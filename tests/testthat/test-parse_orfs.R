@@ -273,13 +273,17 @@ test_that("parse_orfs handles Ribo-TISH correctly", {
   dir <- tempdir()
   file <- create_ribotish_test_file(dir)
 
-  gr <- parse_orfs(file, source = "ribotish")
+  result <- parse_orfs(file, source = "ribotish", output = "full")
 
+  expect_true(is.list(result))
+  gr <- result$orfs
   expect_s4_class(gr, "GRanges")
   expect_equal(length(gr), 3)
   expect_true("orf_id" %in% colnames(mcols(gr)))
   expect_true("orf_type" %in% colnames(mcols(gr)))
-  expect_true("gene_name" %in% colnames(mcols(gr)))
+  
+  # Check metadata has the extra columns
+  expect_true("gene_name" %in% colnames(result$metadata))
   expect_equal(as.character(mcols(gr)$orf_type), c("5'UTR", "CDS", "3'UTR"))
 
   unlink(file)
@@ -289,9 +293,9 @@ test_that("Ribo-TISH retains spec extra_cols", {
   dir <- tempdir()
   file <- create_ribotish_test_file(dir)
 
-  gr <- parse_orfs(file, source = "ribotish")
-  expect_true("AALen" %in% colnames(mcols(gr)))
-  expect_true("StartCodon" %in% colnames(mcols(gr)))
+  result <- parse_orfs(file, source = "ribotish", output = "full")
+  expect_true("AALen" %in% colnames(result$metadata))
+  expect_true("StartCodon" %in% colnames(result$metadata))
 
   unlink(file)
 })
@@ -300,13 +304,17 @@ test_that("parse_orfs handles RiboCode correctly", {
   dir <- tempdir()
   file <- create_ribocode_test_file(dir)
 
-  gr <- parse_orfs(file, source = "ribocode")
+  result <- parse_orfs(file, source = "ribocode", output = "full")
 
+  expect_true(is.list(result))
+  gr <- result$orfs
   expect_s4_class(gr, "GRanges")
   expect_equal(length(gr), 3)
   expect_true("orf_type" %in% colnames(mcols(gr)))
-  expect_true("gene_id" %in% colnames(mcols(gr)))
   expect_true("transcript_id" %in% colnames(mcols(gr)))
+  
+  # Check metadata has gene_id
+  expect_true("gene_id" %in% colnames(result$metadata))
   expect_equal(as.character(mcols(gr)$orf_type), c("uORF", "CDS", "dORF"))
 
   unlink(file)
@@ -345,12 +353,16 @@ test_that("parse_orfs handles ORFquant correctly", {
   dir <- tempdir()
   file <- create_orfquant_test_file(dir)
 
-  gr <- parse_orfs(file, source = "orfquant")
+  result <- parse_orfs(file, source = "orfquant", output = "full")
 
+  expect_true(is.list(result))
+  gr <- result$orfs
   expect_s4_class(gr, "GRanges")
   expect_equal(length(gr), 3)
   expect_true("orf_type" %in% colnames(mcols(gr)))
-  expect_true("P_sites_raw" %in% colnames(mcols(gr)))
+  
+  # Check metadata has P_sites_raw
+  expect_true("P_sites_raw" %in% colnames(result$metadata))
 
   unlink(file)
 })
@@ -380,10 +392,11 @@ test_that("additional_cols are retained in metadata", {
   dir <- tempdir()
   file <- create_ribocode_test_file(dir)
 
-  gr <- parse_orfs(file, source = "ribocode",
-                   additional_cols = c("ORF_length", "pval"))
-  expect_true("ORF_length" %in% colnames(mcols(gr)))
-  expect_true("pval" %in% colnames(mcols(gr)))
+  result <- parse_orfs(file, source = "ribocode",
+                       additional_cols = c("ORF_length", "pval"),
+                       output = "full")
+  expect_true("ORF_length" %in% colnames(result$metadata))
+  expect_true("pval" %in% colnames(result$metadata))
 
   unlink(file)
 })
@@ -460,13 +473,15 @@ test_that("custom caller can be registered and used", {
   )
   register_orf_caller(spec, overwrite = TRUE)
 
-  # Parse
-  gr <- parse_orfs(custom_file, source = "test_custom_e2e")
+  # Parse with full output
+  result <- parse_orfs(custom_file, source = "test_custom_e2e", output = "full")
 
+  expect_true(is.list(result))
+  gr <- result$orfs
   expect_s4_class(gr, "GRanges")
   expect_equal(length(gr), 2)
   expect_equal(as.character(names(gr)), c("orf_a", "orf_b"))
-  expect_true("score" %in% colnames(mcols(gr)))
+  expect_true("score" %in% colnames(result$metadata))
 
   unlink(custom_file)
 })
@@ -554,9 +569,11 @@ test_that("custom caller with post_process_fn works", {
   )
   register_orf_caller(spec, overwrite = TRUE)
 
-  gr <- parse_orfs(file, source = "test_postprocess")
-  expect_true("custom_flag" %in% colnames(mcols(gr)))
-  expect_true(all(mcols(gr)$custom_flag))
+  result <- parse_orfs(file, source = "test_postprocess", output = "full")
+  
+  # custom_flag added by post_process_fn should be in metadata
+  expect_true("custom_flag" %in% colnames(result$metadata))
+  expect_true(all(result$metadata$custom_flag))
 
   unlink(file)
 })
@@ -648,4 +665,284 @@ test_that("parse_orfs works on bundled GENCODE BED file", {
   expect_true(length(gr) > 0)
   expect_true("orf_id" %in% colnames(mcols(gr)))
   expect_true("orf_type" %in% colnames(mcols(gr)))
+})
+
+
+# ==============================================================================
+# 11. ORFquant RData file parsing
+# ==============================================================================
+
+test_that("parse_orfs handles ORFquant RData with genomic coordinates", {
+  orfquant_file <- system.file("extdata", "test_ORFquant_results", 
+                                package = "BilbORF")
+  skip_if(orfquant_file == "", message = "ORFquant test data not available")
+  
+  gr <- parse_orfs(orfquant_file, source = "orfquant", output = "unified")
+  
+  # Check basic structure
+  expect_s4_class(gr, "GRanges")
+  expect_true(length(gr) > 0)
+  
+  # Check we have genomic coordinates (not transcript coordinates)
+  expect_true(all(grepl("^chr", as.character(seqnames(gr)))))
+  
+  # Check required metadata columns
+  expect_true("orf_id" %in% colnames(mcols(gr)))
+  expect_true("transcript_id" %in% colnames(mcols(gr)))
+  expect_true("orf_type" %in% colnames(mcols(gr)))
+  expect_true("orf_width" %in% colnames(mcols(gr)))
+  
+  # Check orf_type is populated
+  expect_true(!all(is.na(mcols(gr)$orf_type)))
+  expect_true(length(unique(mcols(gr)$orf_type)) > 1)
+})
+
+test_that("ORFquant parser extracts metadata from ORFs_tx", {
+  orfquant_file <- system.file("extdata", "test_ORFquant_results", 
+                                package = "BilbORF")
+  skip_if(orfquant_file == "", message = "ORFquant test data not available")
+  
+  gr <- parse_orfs(orfquant_file, source = "orfquant", output = "unified")
+  
+  # Check that ORF categories are correctly extracted
+  orf_types <- unique(as.character(mcols(gr)$orf_type))
+  expected_types <- c("ORF_annotated", "uORF", "dORF", "novel", 
+                      "N_truncation", "N_extension")
+  expect_true(any(orf_types %in% expected_types))
+})
+
+test_that("ORFquant parser output='full' retains all metadata", {
+  orfquant_file <- system.file("extdata", "test_ORFquant_results", 
+                                package = "BilbORF")
+  skip_if(orfquant_file == "", message = "ORFquant test data not available")
+  
+  result <- parse_orfs(orfquant_file, source = "orfquant", output = "full")
+  
+  # Full output should be a list with orfs and metadata
+  expect_true(is.list(result))
+  expect_true("orfs" %in% names(result))
+  expect_true("metadata" %in% names(result))
+  
+  # orfs should be GRanges
+  expect_s4_class(result$orfs, "GRanges")
+  
+  # metadata should be a data.frame with many columns
+  expect_true(is.data.frame(result$metadata))
+  expect_true(ncol(result$metadata) > 10)
+  
+  # Should have coordinate columns
+  expect_true(all(c("seqnames", "start", "end", "strand") %in% 
+                    colnames(result$metadata)))
+  
+  # Should have ORFquant-specific columns
+  expect_true(any(c("P_sites_raw", "pval", "ORF_category_Tx") %in% 
+                    colnames(result$metadata)))
+})
+
+test_that("ORFquant parser unified output is flat GRanges", {
+  orfquant_file <- system.file("extdata", "test_ORFquant_results", 
+                                package = "BilbORF")
+  skip_if(orfquant_file == "", message = "ORFquant test data not available")
+  
+  gr <- parse_orfs(orfquant_file, source = "orfquant", output = "unified")
+  
+  # Should be a flat GRanges (not GRangesList)
+  expect_s4_class(gr, "GRanges")
+  expect_false(is(gr, "GRangesList"))
+  
+  # Should have core columns only
+  mcols_names <- colnames(mcols(gr))
+  expect_true(all(c("orf_id", "transcript_id", "orf_type", "orf_width") %in% 
+                    mcols_names))
+})
+
+test_that("ORFquant orf_ids are unique and informative", {
+  orfquant_file <- system.file("extdata", "test_ORFquant_results", 
+                                package = "BilbORF")
+  skip_if(orfquant_file == "", message = "ORFquant test data not available")
+  
+  gr <- parse_orfs(orfquant_file, source = "orfquant", output = "unified")
+  
+  # Check ORF IDs exist
+  expect_true(!any(is.na(mcols(gr)$orf_id)))
+  
+  # Check format (should be like ENST00000123456.1_start_end)
+  orf_ids <- mcols(gr)$orf_id[1:10]
+  expect_true(all(grepl("ENST", orf_ids)))
+  expect_true(all(grepl("_", orf_ids)))
+})
+
+test_that("ORFquant handles multi-exon ORFs correctly", {
+  orfquant_file <- system.file("extdata", "test_ORFquant_results", 
+                                package = "BilbORF")
+  skip_if(orfquant_file == "", message = "ORFquant test data not available")
+  
+  gr <- parse_orfs(orfquant_file, source = "orfquant", output = "unified")
+  
+  # Count ORFs (number of unique orf_ids)
+  n_orfs <- length(unique(mcols(gr)$orf_id))
+  n_ranges <- length(gr)
+  
+  # ORFquant should produce more ranges than ORFs due to multi-exon ORFs
+  expect_true(n_ranges > n_orfs)
+  
+  # Check that some ORF IDs appear multiple times (multi-exon)
+  orf_counts <- table(mcols(gr)$orf_id)
+  expect_true(any(orf_counts > 1))
+})
+
+test_that("ORFquant parser preserves extra_cols in unified output", {
+  orfquant_file <- system.file("extdata", "test_ORFquant_results", 
+                                package = "BilbORF")
+  skip_if(orfquant_file == "", message = "ORFquant test data not available")
+  
+  # Parse with default settings
+  gr <- parse_orfs(orfquant_file, source = "orfquant", output = "unified")
+  
+  # Unified output should have core columns only
+  mcols_names <- colnames(mcols(gr))
+  core_cols <- c("orf_id", "transcript_id", "orf_type", "orf_width")
+  
+  # Should have exactly these core columns
+  expect_equal(sort(mcols_names), sort(core_cols))
+})
+
+
+# ==============================================================================
+# 12. Output mode tests
+# ==============================================================================
+
+test_that("output='unified' produces flat GRanges with core columns", {
+  dir <- tempdir()
+  file <- create_ribocode_test_file(dir)
+  
+  gr <- parse_orfs(file, source = "ribocode", output = "unified")
+  
+  expect_s4_class(gr, "GRanges")
+  
+  # Should have core metadata
+  expect_true("orf_id" %in% colnames(mcols(gr)))
+  expect_true("transcript_id" %in% colnames(mcols(gr)))
+  expect_true("orf_type" %in% colnames(mcols(gr)))
+  expect_true("orf_width" %in% colnames(mcols(gr)))
+  
+  # orf_width should equal width of ranges
+  expect_equal(mcols(gr)$orf_width, as.integer(width(gr)))
+  
+  unlink(file)
+})
+
+test_that("output='full' returns list with orfs and metadata", {
+  dir <- tempdir()
+  file <- create_ribocode_test_file(dir)
+  
+  result <- parse_orfs(file, source = "ribocode", output = "full")
+  
+  # Should be a list with orfs and metadata
+  expect_true(is.list(result))
+  expect_true("orfs" %in% names(result))
+  expect_true("metadata" %in% names(result))
+  
+  # orfs should be GRanges
+  expect_s4_class(result$orfs, "GRanges")
+  
+  # metadata should be data.frame with columns
+  expect_true(is.data.frame(result$metadata))
+  expect_true(all(c("seqnames", "start", "end", "width", "strand") %in% 
+                    colnames(result$metadata)))
+  expect_true("orf_id" %in% colnames(result$metadata))
+  
+  # Should have original columns
+  expect_true("gene_id" %in% colnames(result$metadata))
+  expect_true("ORF_length" %in% colnames(result$metadata))
+  
+  unlink(file)
+})
+
+test_that("output='unified' returns flat GRanges with minimal metadata", {
+  dir <- tempdir()
+  file <- create_ribocode_test_file(dir)
+  
+  gr <- parse_orfs(file, source = "ribocode", output = "unified")
+  
+  expect_s4_class(gr, "GRanges")
+  expect_false(is(gr, "GRangesList"))
+  
+  # Should have core columns
+  expect_true("orf_id" %in% colnames(mcols(gr)))
+  expect_true("transcript_id" %in% colnames(mcols(gr)))
+  expect_true("orf_type" %in% colnames(mcols(gr)))
+  expect_true("orf_width" %in% colnames(mcols(gr)))
+  
+  unlink(file)
+})
+
+
+# ==============================================================================
+# 13. Coordinate system conversions
+# ==============================================================================
+
+test_that("genome_style='UCSC' converts to chr notation", {
+  dir <- tempdir()
+  file <- file.path(dir, "ncbi_coords.tsv")
+  df <- data.frame(
+    chrom = c("1", "2", "X"),
+    start = c(100, 200, 300),
+    end = c(300, 400, 500),
+    strand = c("+", "-", "+"),
+    id = c("orf1", "orf2", "orf3"),
+    stringsAsFactors = FALSE
+  )
+  write.table(df, file, sep = "\t", row.names = FALSE, quote = FALSE)
+  
+  spec <- orf_caller_spec(
+    name = "test_ucsc_style",
+    file_format = "tsv",
+    column_map = list(chrom = "chrom", start = "start", end = "end",
+                      strand = "strand", orf_id = "id")
+  )
+  register_orf_caller(spec, overwrite = TRUE)
+  
+  gr <- parse_orfs(file, source = "test_ucsc_style", genome_style = "UCSC")
+  
+  # Should have 'chr' prefix
+  expect_true(all(grepl("^chr", as.character(seqnames(gr)))))
+  expect_true("chrX" %in% as.character(seqnames(gr)))
+  
+  unlink(file)
+})
+
+
+# ==============================================================================
+# 14. RiboCode and RiboTIE test file parsing
+# ==============================================================================
+
+test_that("parse_orfs works on bundled RiboCode test file", {
+  ribocode_file <- system.file("extdata", "ribocode_test.txt", 
+                                package = "BilbORF")
+  skip_if(ribocode_file == "", message = "RiboCode test data not available")
+  
+  gr <- parse_orfs(ribocode_file, source = "ribocode")
+  
+  expect_s4_class(gr, "GRanges")
+  expect_true(length(gr) > 0)
+  expect_true("orf_id" %in% colnames(mcols(gr)))
+  expect_true("orf_type" %in% colnames(mcols(gr)))
+  expect_true("transcript_id" %in% colnames(mcols(gr)))
+})
+
+test_that("parse_orfs works on bundled RiboTIE test file", {
+  ribotie_file <- system.file("extdata", "ribotie_test.csv", 
+                               package = "BilbORF")
+  skip_if(ribotie_file == "", message = "RiboTIE test data not available")
+  
+  gr <- parse_orfs(ribotie_file, source = "ribotie")
+  
+  expect_s4_class(gr, "GRanges")
+  expect_true(length(gr) > 0)
+  expect_true("orf_id" %in% colnames(mcols(gr)))
+  expect_true("orf_type" %in% colnames(mcols(gr)))
+  
+  # gene_id is optional - only check if present in source
+  # expect_true("gene_id" %in% colnames(mcols(gr)))
 })

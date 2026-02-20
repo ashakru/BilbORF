@@ -480,27 +480,31 @@ parse_orfs <- function(file,
   # because .make_unified_output() strips metadata down to core columns
   
   # Extract all metadata into a data.frame
-  # Prefer raw_data when available (has original unprocessed metadata)
-  if (is.data.frame(raw_data)) {
-    # If raw data is a data.frame, use it directly
-    metadata <- raw_data
+  # Prefer gr (processed data with mapped column names) over raw_data
+  # except when raw_data is GRanges (e.g., ORFquant ORFs_tx with extra metadata)
+  if (is(gr, "GRanges") || is(gr, "GRangesList")) {
+    # Extract from gr first
+    if (is(gr, "GRangesList")) {
+      gr_unlisted <- unlist(gr, use.names = TRUE)
+      metadata <- .mcols_to_dataframe(gr_unlisted)
+    } else {
+      metadata <- .mcols_to_dataframe(gr)
+    }
   } else if (is(raw_data, "GRanges") || is(raw_data, "GRangesList")) {
-    # If raw_data is GRanges (e.g., ORFquant ORFs_tx), extract from it
-    # This preserves all original metadata columns before processing
+    # If gr is not GRanges but raw_data is (e.g., ORFquant case),
+    # extract from raw_data
     if (is(raw_data, "GRangesList")) {
       raw_gr <- unlist(raw_data, use.names = TRUE)
     } else {
       raw_gr <- raw_data
     }
-    # Convert DataFrame mcols to data.frame, handling complex column types
     metadata <- .mcols_to_dataframe(raw_gr)
-  } else if (is(gr, "GRanges")) {
-    # Fall back to extracting from gr
-    metadata <- .mcols_to_dataframe(gr)
+  } else if (is.data.frame(raw_data)) {
+    # Last resort: use raw data.frame if gr is not GRanges
+    metadata <- raw_data
   } else {
-    # For GRangesList, unlist and extract
-    gr_unlisted <- unlist(gr, use.names = TRUE)
-    metadata <- .mcols_to_dataframe(gr_unlisted)
+    # No metadata available
+    metadata <- data.frame()
   }
   
   # Get unified output (grouped GRangesList)
