@@ -284,12 +284,18 @@ supported_orf_callers <- function() {
 #'   ("1"). Chromosome names are converted to match.
 #' @param min_length Minimum ORF length in nucleotides. ORFs shorter than
 #'   this are dropped. Default \code{NULL} (no filter).
+#' @param output Output format: \code{"unified"} (default) returns a
+#'   GRanges with core metadata (genomic coordinates, transcript_id, orf_type,
+#'   orf_width, orf_id); \code{"full"} returns a list with both
+#'   the unified GRanges and a data.frame of all caller-specific metrics.
 #' @param additional_cols Character vector of extra caller-specific columns
-#'   to retain as GRanges metadata.
+#'   to retain. Only used when \code{output = "full"}.
 #'
-#' @return A named GRanges object with canonical metadata columns
-#'   (\code{orf_id}, and optionally \code{orf_type}, \code{gene_id},
-#'   \code{gene_name}, \code{transcript_id}).
+#' @return If \code{output = "unified"} (default), a GRanges with one range
+#'   per exon/segment and metadata columns: \code{orf_id} (unique identifier),
+#'   \code{transcript_id}, \code{orf_type}, \code{orf_width} (width of this range).
+#'   If \code{output = "full"}, a list with two elements: \code{orfs} (the unified
+#'   GRanges) and \code{metadata} (data.frame with all caller metrics).
 #'
 #' @details
 #' The parse pipeline:
@@ -302,31 +308,56 @@ supported_orf_callers <- function() {
 #'   \item Run \code{post_process_fn} if defined.
 #'   \item Map additional metadata columns.
 #'   \item Ensure unique names, apply genome style, filter by length.
+#'   \item Format output: unified mode returns a GRanges with core metadata
+#'     columns; full mode also returns all caller-specific metrics in a
+#'     separate data.frame.
 #' }
+#'
+#' The unified output is compatible with ORFik's suite of ORF analysis
+#' functions for downstream processing.
 #'
 #' @export
 #' @importFrom rtracklayer import
 #' @importFrom GenomeInfoDb seqlevelsStyle seqlevelsStyle<-
 #' @importFrom GenomicRanges GRanges mcols mcols<-
 #' @importFrom IRanges IRanges
+#' @importFrom S4Vectors mcols mcols<- DataFrame
 #'
 #' @examples
 #' # Parse GENCODE consensus ORFs (ships with package)
 #' bed <- system.file("extdata", "Ribo-seq_ORFs.bed", package = "BilbORF")
 #' if (bed != "") {
+#'   # Unified output: GRangesList with core metadata
 #'   orfs <- parse_orfs(bed, source = "gencode")
-#'   print(length(orfs))
+#'   print(length(orfs))  # Number of ORFs
+#'   print(orfs[[1]])     # First ORF's ranges
+#'   
+#'   # Full output: includes all caller metrics
+#'   full <- parse_orfs(bed, source = "gencode", output = "full")
+#'   print(names(full))           # "orfs" and "metadata"
+#'   print(head(full$metadata))   # All columns from caller
 #' }
 #'
 #' \dontrun{
-#' # Parse Ribo-TISH results
+#' # Parse Ribo-TISH results (unified output by default)
 #' orfs <- parse_orfs("ribotish_pred.txt", source = "ribotish")
 #'
-#' # Parse RiboCode with Ensembl chromosomes
-#' orfs <- parse_orfs("ribocode.txt",
-#'                    source = "ribocode",
-#'                    genome_style = "Ensembl")
+#' # Parse RiboCode with Ensembl chromosomes, get full metrics
+#' result <- parse_orfs("ribocode.txt",
+#'                      source = "ribocode",
+#'                      genome_style = "Ensembl",
+#'                      output = "full")
+#' orfs_grl <- result$orfs
+#' metrics <- result$metadata  # All RiboCode columns (pval, Psites, etc.)
 #'
+#' # Use ORFik functions on the unified output
+#' library(ORFik)
+#' orfs <- parse_orfs("ribocode.txt", source = "ribocode")
+#' # Calculate total ORF widths per group
+#' widths <- sum(width(orfs))
+#' # Extract start codons (requires genome/transcript sequences)
+#' # start_codons <- startCodons(orfs, faFile = "genome.fa")
+#' 
 #' # Register and use a custom caller
 #' my_spec <- orf_caller_spec(
 #'   name = "my_caller", file_format = "tsv",
@@ -345,6 +376,7 @@ parse_orfs <- function(file,
                        source,
                        genome_style    = "UCSC",
                        min_length      = NULL,
+                       output          = c("unified", "full"),
                        additional_cols = NULL) {
 
   # --- Validate inputs --------------------------------------------------------
@@ -352,6 +384,7 @@ parse_orfs <- function(file,
   if (!genome_style %in% c("UCSC", "Ensembl")) {
     stop("genome_style must be 'UCSC' or 'Ensembl'.")
   }
+  output <- match.arg(output)
 
   spec <- get_orf_caller(source)
 
@@ -367,6 +400,18 @@ parse_orfs <- function(file,
       gr <- spec$post_process_fn(gr, raw)
     } else {
       gr <- spec$post_process_fn(gr, NULL)
+    }
+  }
+
+  # --- 4.5. Strip metadata early for unified output (performance optimization) --
+  # For unified output, we only need transcript_id, orf_type, orf_id
+  # Stripping unnecessary columns (especially complex types like CompressedLists)
+  # before genome style conversion significantly improves performance
+  if (output == "unified") {
+    cols_to_keep <- c("transcript_id", "orf_type", "orf_id")
+    existing_cols <- cols_to_keep[cols_to_keep %in% colnames(GenomicRanges::mcols(gr))]
+    if (length(existing_cols) > 0 && length(existing_cols) < ncol(GenomicRanges::mcols(gr))) {
+      GenomicRanges::mcols(gr) <- GenomicRanges::mcols(gr)[, existing_cols, drop = FALSE]
     }
   }
 
@@ -398,13 +443,126 @@ parse_orfs <- function(file,
     }
   }
 
-  gr
+  # --- 8. Format output -------------------------------------------------------
+  if (output == "unified") {
+    return(.make_unified_output(gr))
+  } else {
+    return(.make_full_output(gr, raw))
+  }
 }
 
 
 # ==============================================================================
 # Internal helpers
 # ==============================================================================
+
+#' Create unified output (GRanges with core metadata)
+#' @keywords internal
+.make_unified_output <- function(gr) {
+  # Keep only essential metadata columns
+  mcols_to_keep <- c("orf_id", "transcript_id", "orf_type")
+  existing_cols <- mcols_to_keep[mcols_to_keep %in% colnames(GenomicRanges::mcols(gr))]
+  
+  if (length(existing_cols) > 0 && ncol(GenomicRanges::mcols(gr)) > length(existing_cols)) {
+    GenomicRanges::mcols(gr) <- GenomicRanges::mcols(gr)[, existing_cols, drop = FALSE]
+  }
+  
+  # Add orf_width (width of each range)
+  GenomicRanges::mcols(gr)$orf_width <- IRanges::width(gr)
+  
+  gr
+}
+
+#' Create full output (list with unified GRangesList and metadata table)
+#' @keywords internal
+.make_full_output <- function(gr, raw_data) {
+  # IMPORTANT: Extract metadata BEFORE calling .make_unified_output()
+  # because .make_unified_output() strips metadata down to core columns
+  
+  # Extract all metadata into a data.frame
+  # Prefer raw_data when available (has original unprocessed metadata)
+  if (is.data.frame(raw_data)) {
+    # If raw data is a data.frame, use it directly
+    metadata <- raw_data
+  } else if (is(raw_data, "GRanges") || is(raw_data, "GRangesList")) {
+    # If raw_data is GRanges (e.g., ORFquant ORFs_tx), extract from it
+    # This preserves all original metadata columns before processing
+    if (is(raw_data, "GRangesList")) {
+      raw_gr <- unlist(raw_data, use.names = TRUE)
+    } else {
+      raw_gr <- raw_data
+    }
+    # Convert DataFrame mcols to data.frame, handling complex column types
+    metadata <- .mcols_to_dataframe(raw_gr)
+  } else if (is(gr, "GRanges")) {
+    # Fall back to extracting from gr
+    metadata <- .mcols_to_dataframe(gr)
+  } else {
+    # For GRangesList, unlist and extract
+    gr_unlisted <- unlist(gr, use.names = TRUE)
+    metadata <- .mcols_to_dataframe(gr_unlisted)
+  }
+  
+  # Get unified output (grouped GRangesList)
+  orfs <- .make_unified_output(gr)
+  
+  list(orfs = orfs, metadata = metadata)
+}
+
+#' Convert GRanges mcols to a simple data.frame
+#' Handles complex column types like GRanges, AAStringSet, CompressedLists
+#' @keywords internal
+.mcols_to_dataframe <- function(gr) {
+  mcols_df <- GenomicRanges::mcols(gr)
+  
+  # Add coordinate information first
+  coord_df <- data.frame(
+    seqnames = as.character(GenomicRanges::seqnames(gr)),
+    start = GenomicRanges::start(gr),
+    end = GenomicRanges::end(gr),
+    strand = as.character(GenomicRanges::strand(gr)),
+    width = IRanges::width(gr),
+    stringsAsFactors = FALSE,
+    row.names = NULL
+  )
+  
+  if (ncol(mcols_df) == 0) {
+    return(coord_df)
+  }
+  
+  # Fast path: Try direct conversion (works for simple types)
+  metadata <- tryCatch({
+    df <- as.data.frame(mcols_df, stringsAsFactors = FALSE)
+    rownames(df) <- NULL
+    df
+  }, error = function(e) {
+    # Slow path: Handle complex types one by one
+    col_list <- list()
+    for (i in seq_len(ncol(mcols_df))) {
+      col_name <- colnames(mcols_df)[i]
+      col_data <- mcols_df[[i]]
+      
+      col_list[[col_name]] <- tryCatch({
+        if (is(col_data, "CompressedList") || is(col_data, "List")) {
+          I(as.list(col_data))
+        } else if (is(col_data, "AAStringSet")) {
+          as.character(col_data)
+        } else if (is(col_data, "GRanges") || is(col_data, "GRangesList")) {
+          as.character(col_data)
+        } else {
+          col_data
+        }
+      }, error = function(e2) {
+        tryCatch(as.character(col_data), 
+                error = function(e3) I(as.list(col_data)))
+      })
+    }
+    data.frame(col_list, stringsAsFactors = FALSE, check.names = FALSE, row.names = NULL)
+  })
+  
+  # Combine with coordinates
+  cbind(metadata, coord_df)
+}
 
 #' Read a file according to its spec
 #' @keywords internal
@@ -711,17 +869,33 @@ parse_orfs <- function(file,
       end    = c("ORF_End", "end"),
       strand = c("Strand", "strand"),
       orf_id   = c("ORF_id_tr", "ORF_ID", "orf_id", "ORF_id"),
-      orf_type = c("ORF_category_Tx", "ORF_category", "ORF_type", "category"),
+      orf_type = c("ORF_category_Tx", "ORF_category_Gen", "ORF_category", "ORF_type", "category"),
       gene_id  = "gene_id",
       gene_name = "gene_name",
       transcript_id = "transcript_id"
     ),
     coord_system = "1-based",
     url          = "https://github.com/lcalviell/ORFquant",
-    extra_cols   = c("P_sites_raw", "P_sites_raw_uniq", "pval"),
+    extra_cols   = c("P_sites_raw", "P_sites_raw_uniq", "pval", 
+                     "ORF_category_Tx", "ORF_category_Tx_compatible", "ORF_category_Gen"),
+    post_process_fn = function(gr, raw_data) {
+      # For ORFquant GRanges from ORFs_gen or ORFs_tx, ensure orf_type is set
+      # Check both ORF_category_Tx and ORF_category_Gen
+      gr_mcols <- GenomicRanges::mcols(gr)
+      
+      # Set orf_type if missing or all NA
+      if (!"orf_type" %in% colnames(gr_mcols) || all(is.na(gr_mcols$orf_type))) {
+        if ("ORF_category_Tx" %in% colnames(gr_mcols) && !all(is.na(gr_mcols$ORF_category_Tx))) {
+          GenomicRanges::mcols(gr)$orf_type <- as.character(gr_mcols$ORF_category_Tx)
+        } else if ("ORF_category_Gen" %in% colnames(gr_mcols) && !all(is.na(gr_mcols$ORF_category_Gen))) {
+          GenomicRanges::mcols(gr)$orf_type <- as.character(gr_mcols$ORF_category_Gen)
+        }
+      }
+      gr
+    },
     read_fn = function(file) {
       # ORFquant saves results as RData with ORFquant_results list.
-      # The key element is ORFs_gen (genomic GRanges) or ORFs_tx (tx-level).
+      # Use ORFs_gen (genomic coordinates) and merge metadata from ORFs_tx if available.
       # Also supports plain RDS with GRanges or TSV.
       if (grepl("\\.rds$", file, ignore.case = TRUE)) {
         obj <- readRDS(file)
@@ -739,8 +913,263 @@ parse_orfs <- function(file,
         # Look for ORFquant_results list first
         if ("ORFquant_results" %in% obj_names) {
           res <- e$ORFquant_results
-          if ("ORFs_gen" %in% names(res)) return(res$ORFs_gen)
-          if ("ORFs_tx" %in% names(res)) return(res$ORFs_tx)
+          
+          # Strategy: Use ORFs_gen for genomic coordinates, merge metadata from ORFs_tx
+          if ("ORFs_gen" %in% names(res) && "ORFs_tx" %in% names(res)) {
+            # Both available - use genomic coords with transcript metadata
+            gen <- res$ORFs_gen
+            tx <- res$ORFs_tx
+            
+            # ORFs_gen may have no metadata columns but have names that correspond to ORF IDs
+            # These names match ORF_id_tr in ORFs_tx
+            gen_has_names <- !is.null(names(gen))
+            gen_has_metadata <- ncol(GenomicRanges::mcols(gen)) > 0
+            
+            if (gen_has_names) {
+              # Use names from ORFs_gen as orf_id and merge metadata from ORFs_tx
+              GenomicRanges::mcols(gen)$orf_id <- names(gen)
+              
+              # Find the ORF ID column in ORFs_tx
+              tx_mcols <- colnames(GenomicRanges::mcols(tx))
+              orf_id_variants <- c("orf_id", "ORF_id", "ORF_ID", "ORF_id_tr", "ORF_id_gen")
+              tx_orf_col <- intersect(orf_id_variants, tx_mcols)[1]
+              
+              if (!is.na(tx_orf_col)) {
+                # Extract metadata columns from tx
+                tx_metadata <- GenomicRanges::mcols(tx)
+                metadata_cols <- setdiff(colnames(tx_metadata), 
+                                         c("seqnames", "start", "end", "width", "strand"))
+                
+                # Match by orf_id
+                gen_orf_ids <- names(gen)
+                tx_orf_ids <- tx_metadata[[tx_orf_col]]
+                match_idx <- match(gen_orf_ids, tx_orf_ids)
+                
+                # Copy metadata columns directly from tx to gen
+                for (col in metadata_cols) {
+                  if (col %in% colnames(tx_metadata)) {
+                    GenomicRanges::mcols(gen)[[col]] <- tx_metadata[[col]][match_idx]
+                  }
+                }
+                
+                # Set orf_type from category columns
+                gen_mcols_obj <- GenomicRanges::mcols(gen)
+                if (!"orf_type" %in% colnames(gen_mcols_obj) || all(is.na(gen_mcols_obj$orf_type))) {
+                  if ("ORF_category_Tx" %in% colnames(gen_mcols_obj) && !all(is.na(gen_mcols_obj$ORF_category_Tx))) {
+                    GenomicRanges::mcols(gen)$orf_type <- as.character(gen_mcols_obj$ORF_category_Tx)
+                  } else if ("ORF_category_Gen" %in% colnames(gen_mcols_obj) && !all(is.na(gen_mcols_obj$ORF_category_Gen))) {
+                    GenomicRanges::mcols(gen)$orf_type <- as.character(gen_mcols_obj$ORF_category_Gen)
+                  }
+                }
+                
+                return(gen)
+              }
+            } else if (!gen_has_metadata) {
+              # ORFs_gen has no names and no metadata - fall back to ORFs_tx
+              warning("ORFquant ORFs_gen has no names or metadata. ",
+                      "Using ORFs_tx (transcript coordinates) instead.")
+              gen <- tx
+              tx <- NULL  # Signal fallback
+            }
+            
+            # Handle fallback case (tx is NULL)
+            if (is.null(tx)) {
+              # Handle standalone gen (which is actually ORFs_tx)
+              if (is(gen, "GRangesList")) {
+                orf_ids_gen <- rep(names(gen), elementNROWS(gen))
+                gen <- unlist(gen, use.names = FALSE)
+                GenomicRanges::mcols(gen)$orf_id <- orf_ids_gen
+              } else {
+                # Standardize orf_id column name
+                gen_mcols_cols <- colnames(GenomicRanges::mcols(gen))
+                orf_id_variants <- c("orf_id", "ORF_id", "ORF_ID", "ORF_id_tr", "ORF_id_gen")
+                gen_orf_col <- intersect(orf_id_variants, gen_mcols_cols)[1]
+                
+                if (!is.na(gen_orf_col) && gen_orf_col != "orf_id") {
+                  GenomicRanges::mcols(gen)$orf_id <- GenomicRanges::mcols(gen)[[gen_orf_col]]
+                } else if (is.na(gen_orf_col)) {
+                  if (!is.null(names(gen))) {
+                    GenomicRanges::mcols(gen)$orf_id <- names(gen)
+                  } else {
+                    warning("No orf_id column found in ORFquant data, creating sequential IDs")
+                    GenomicRanges::mcols(gen)$orf_id <- paste0("ORF_", seq_along(gen))
+                  }
+                }
+              }
+              
+              # Set orf_type from category columns
+              gen_mcols_obj <- GenomicRanges::mcols(gen)
+              if (!"orf_type" %in% colnames(gen_mcols_obj) || all(is.na(gen_mcols_obj$orf_type))) {
+                if ("ORF_category_Tx" %in% colnames(gen_mcols_obj) && !all(is.na(gen_mcols_obj$ORF_category_Tx))) {
+                  GenomicRanges::mcols(gen)$orf_type <- as.character(gen_mcols_obj$ORF_category_Tx)
+                } else if ("ORF_category_Gen" %in% colnames(gen_mcols_obj) && !all(is.na(gen_mcols_obj$ORF_category_Gen))) {
+                  GenomicRanges::mcols(gen)$orf_type <- as.character(gen_mcols_obj$ORF_category_Gen)
+                }
+              }
+              
+              return(gen)
+            }
+            
+            # If we reach here, we have both gen and tx with metadata columns to merge
+            # (This handles the case where ORFs_gen has metadata in columns)
+            
+            # If GRangesList, unlist and propagate names as orf_id
+            if (is(gen, "GRangesList")) {
+              orf_ids_gen <- rep(names(gen), elementNROWS(gen))
+              gen <- unlist(gen, use.names = FALSE)
+              if (is.null(GenomicRanges::mcols(gen)$orf_id)) {
+                GenomicRanges::mcols(gen)$orf_id <- orf_ids_gen
+              }
+            }
+            
+            if (is(tx, "GRangesList")) {
+              orf_ids_tx <- rep(names(tx), elementNROWS(tx))
+              tx <- unlist(tx, use.names = FALSE)
+              if (is.null(GenomicRanges::mcols(tx)$orf_id)) {
+                GenomicRanges::mcols(tx)$orf_id <- orf_ids_tx
+              }
+            }
+            
+            # ORFs_gen has genomic coords but minimal metadata
+            # ORFs_tx has transcript coords but rich metadata
+            # Merge metadata from tx to gen based on orf_id (or variants)
+            
+            gen_mcols <- colnames(GenomicRanges::mcols(gen))
+            tx_mcols <- colnames(GenomicRanges::mcols(tx))
+            
+            # Find orf_id column (try multiple possible names)
+            orf_id_variants <- c("orf_id", "ORF_id", "ORF_ID", "ORF_id_tr", "ORF_id_gen")
+            gen_orf_col <- intersect(orf_id_variants, gen_mcols)[1]
+            tx_orf_col <- intersect(orf_id_variants, tx_mcols)[1]
+            
+            if (!is.na(gen_orf_col) && !is.na(tx_orf_col)) {
+              # Extract metadata columns from tx (excluding coordinate-related)
+              tx_metadata <- GenomicRanges::mcols(tx)
+              metadata_cols <- setdiff(colnames(tx_metadata), 
+                                       c("seqnames", "start", "end", "width", "strand"))
+              
+              # Match by orf_id
+              gen_orf_ids <- GenomicRanges::mcols(gen)[[gen_orf_col]]
+              tx_orf_ids <- tx_metadata[[tx_orf_col]]
+              match_idx <- match(gen_orf_ids, tx_orf_ids)
+              
+              # Directly copy metadata columns from tx to gen (avoid data.frame conversion for complex types)
+              for (col in metadata_cols) {
+                if (col %in% colnames(tx_metadata)) {
+                  # Copy the column directly, preserving complex types
+                  GenomicRanges::mcols(gen)[[col]] <- tx_metadata[[col]][match_idx]
+                }
+              }
+              
+              # Ensure standard orf_id column exists (use the one from gen)
+              if (gen_orf_col != "orf_id") {
+                GenomicRanges::mcols(gen)$orf_id <- GenomicRanges::mcols(gen)[[gen_orf_col]]
+              }
+              
+              # Ensure orf_type is set from category columns if not already present
+              # Priority: ORF_category_Tx > ORF_category_Gen > existing orf_type
+              gen_mcols_obj <- GenomicRanges::mcols(gen)
+              if (!"orf_type" %in% colnames(gen_mcols_obj) || all(is.na(gen_mcols_obj$orf_type))) {
+                if ("ORF_category_Tx" %in% colnames(gen_mcols_obj) && !all(is.na(gen_mcols_obj$ORF_category_Tx))) {
+                  GenomicRanges::mcols(gen)$orf_type <- as.character(gen_mcols_obj$ORF_category_Tx)
+                } else if ("ORF_category_Gen" %in% colnames(gen_mcols_obj) && !all(is.na(gen_mcols_obj$ORF_category_Gen))) {
+                  GenomicRanges::mcols(gen)$orf_type <- as.character(gen_mcols_obj$ORF_category_Gen)
+                }
+              }
+            } else {
+              # No matching orf_id columns found - fallback to names or create sequential IDs
+              if (!is.null(names(gen))) {
+                # GRanges with names
+                GenomicRanges::mcols(gen)$orf_id <- names(gen)
+              } else {
+                # Last resort: create sequential IDs
+                warning("No orf_id column found in ORFquant data, creating sequential IDs")
+                GenomicRanges::mcols(gen)$orf_id <- paste0("ORF_", seq_along(gen))
+              }
+            }
+            return(gen)
+          } else if ("ORFs_gen" %in% names(res)) {
+            # Only genomic coords available - standardize orf_id column name
+            gen <- res$ORFs_gen
+            
+            # If GRangesList, unlist and propagate names as orf_id
+            if (is(gen, "GRangesList")) {
+              orf_ids_gen <- rep(names(gen), elementNROWS(gen))
+              gen <- unlist(gen, use.names = FALSE)
+              GenomicRanges::mcols(gen)$orf_id <- orf_ids_gen
+            } else {
+              # Handle regular GRanges
+              gen_mcols <- colnames(GenomicRanges::mcols(gen))
+              orf_id_variants <- c("orf_id", "ORF_id", "ORF_ID", "ORF_id_tr", "ORF_id_gen")
+              gen_orf_col <- intersect(orf_id_variants, gen_mcols)[1]
+              
+              if (!is.na(gen_orf_col) && gen_orf_col != "orf_id") {
+                GenomicRanges::mcols(gen)$orf_id <- GenomicRanges::mcols(gen)[[gen_orf_col]]
+              } else if (is.na(gen_orf_col)) {
+                # No standard orf_id column - try names or create IDs
+                if (!is.null(names(gen))) {
+                  GenomicRanges::mcols(gen)$orf_id <- names(gen)
+                } else {
+                  warning("No orf_id column found in ORFquant ORFs_gen, creating sequential IDs")
+                  GenomicRanges::mcols(gen)$orf_id <- paste0("ORF_", seq_along(gen))
+                }
+              }
+            }
+            
+            # Ensure orf_type is set from category columns
+            gen_mcols_obj <- GenomicRanges::mcols(gen)
+            if (!"orf_type" %in% colnames(gen_mcols_obj) || all(is.na(gen_mcols_obj$orf_type))) {
+              if ("ORF_category_Gen" %in% colnames(gen_mcols_obj) && !all(is.na(gen_mcols_obj$ORF_category_Gen))) {
+                GenomicRanges::mcols(gen)$orf_type <- as.character(gen_mcols_obj$ORF_category_Gen)
+              } else if ("ORF_category_Tx" %in% colnames(gen_mcols_obj) && !all(is.na(gen_mcols_obj$ORF_category_Tx))) {
+                GenomicRanges::mcols(gen)$orf_type <- as.character(gen_mcols_obj$ORF_category_Tx)
+              }
+            }
+            
+            return(gen)
+          } else if ("ORFs_tx" %in% names(res)) {
+            # Only transcript coords available - warn user
+            warning("ORFquant file contains only ORFs_tx (transcript coordinates). ",
+                    "Genomic coordinates (ORFs_gen) are preferred but not found.")
+            
+            tx <- res$ORFs_tx
+            
+            # If GRangesList, unlist and propagate names as orf_id
+            if (is(tx, "GRangesList")) {
+              orf_ids_tx <- rep(names(tx), elementNROWS(tx))
+              tx <- unlist(tx, use.names = FALSE)
+              GenomicRanges::mcols(tx)$orf_id <- orf_ids_tx
+            } else {
+              # Handle regular GRanges
+              tx_mcols <- colnames(GenomicRanges::mcols(tx))
+              orf_id_variants <- c("orf_id", "ORF_id", "ORF_ID", "ORF_id_tr", "ORF_id_gen")
+              tx_orf_col <- intersect(orf_id_variants, tx_mcols)[1]
+              
+              if (!is.na(tx_orf_col) && tx_orf_col != "orf_id") {
+                GenomicRanges::mcols(tx)$orf_id <- GenomicRanges::mcols(tx)[[tx_orf_col]]
+              } else if (is.na(tx_orf_col)) {
+                # No standard orf_id column - try names or create IDs
+                if (!is.null(names(tx))) {
+                  GenomicRanges::mcols(tx)$orf_id <- names(tx)
+                } else {
+                  warning("No orf_id column found in ORFquant ORFs_tx, creating sequential IDs")
+                  GenomicRanges::mcols(tx)$orf_id <- paste0("ORF_", seq_along(tx))
+                }
+              }
+            }
+            
+            # Ensure orf_type is set from category columns
+            tx_mcols_obj <- GenomicRanges::mcols(tx)
+            if (!"orf_type" %in% colnames(tx_mcols_obj) || all(is.na(tx_mcols_obj$orf_type))) {
+              if ("ORF_category_Tx" %in% colnames(tx_mcols_obj) && !all(is.na(tx_mcols_obj$ORF_category_Tx))) {
+                GenomicRanges::mcols(tx)$orf_type <- as.character(tx_mcols_obj$ORF_category_Tx)
+              } else if ("ORF_category_Gen" %in% colnames(tx_mcols_obj) && !all(is.na(tx_mcols_obj$ORF_category_Gen))) {
+                GenomicRanges::mcols(tx)$orf_type <- as.character(tx_mcols_obj$ORF_category_Gen)
+              }
+            }
+            
+            return(tx)
+          }
           stop("ORFquant_results list has no ORFs_gen or ORFs_tx element.")
         }
         # Otherwise look for any GRanges object

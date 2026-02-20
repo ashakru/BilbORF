@@ -9,6 +9,7 @@ parse_orfs(
   source,
   genome_style = "UCSC",
   min_length = NULL,
+  output = c("unified", "full"),
   additional_cols = NULL
 )
 }
@@ -24,13 +25,20 @@ registered \code{orf_caller_spec}. See \code{supported_orf_callers()}.}
 \item{min_length}{Minimum ORF length in nucleotides. ORFs shorter than
 this are dropped. Default \code{NULL} (no filter).}
 
+\item{output}{Output format: \code{"unified"} (default) returns a
+GRanges with core metadata (genomic coordinates, transcript_id, orf_type,
+orf_width, orf_id); \code{"full"} returns a list with both
+the unified GRanges and a data.frame of all caller-specific metrics.}
+
 \item{additional_cols}{Character vector of extra caller-specific columns
-to retain as GRanges metadata.}
+to retain. Only used when \code{output = "full"}.}
 }
 \value{
-A named GRanges object with canonical metadata columns
-(\code{orf_id}, and optionally \code{orf_type}, \code{gene_id},
-\code{gene_name}, \code{transcript_id}).
+If \code{output = "unified"} (default), a GRanges with one range
+per exon/segment and metadata columns: \code{orf_id} (unique identifier),
+\code{transcript_id}, \code{orf_type}, \code{orf_width} (width of this range).
+If \code{output = "full"}, a list with two elements: \code{orfs} (the unified
+GRanges) and \code{metadata} (data.frame with all caller metrics).
 }
 \description{
 A unified interface for importing ORF predictions from Ribo-seq ORF
@@ -51,24 +59,48 @@ for tsv/csv/bed/rds).
 \item Run \code{post_process_fn} if defined.
 \item Map additional metadata columns.
 \item Ensure unique names, apply genome style, filter by length.
+\item Format output: unified mode returns a GRanges with core metadata
+columns; full mode also returns all caller-specific metrics in a
+separate data.frame.
 }
+
+The unified output is compatible with ORFik's suite of ORF analysis
+functions for downstream processing.
 }
 \examples{
 # Parse GENCODE consensus ORFs (ships with package)
 bed <- system.file("extdata", "Ribo-seq_ORFs.bed", package = "BilbORF")
 if (bed != "") {
+  # Unified output: GRangesList with core metadata
   orfs <- parse_orfs(bed, source = "gencode")
-  print(length(orfs))
+  print(length(orfs))  # Number of ORFs
+  print(orfs[[1]])     # First ORF's ranges
+  
+  # Full output: includes all caller metrics
+  full <- parse_orfs(bed, source = "gencode", output = "full")
+  print(names(full))           # "orfs" and "metadata"
+  print(head(full$metadata))   # All columns from caller
 }
 
 \dontrun{
-# Parse Ribo-TISH results
+# Parse Ribo-TISH results (unified output by default)
 orfs <- parse_orfs("ribotish_pred.txt", source = "ribotish")
 
-# Parse RiboCode with Ensembl chromosomes
-orfs <- parse_orfs("ribocode.txt",
-                   source = "ribocode",
-                   genome_style = "Ensembl")
+# Parse RiboCode with Ensembl chromosomes, get full metrics
+result <- parse_orfs("ribocode.txt",
+                     source = "ribocode",
+                     genome_style = "Ensembl",
+                     output = "full")
+orfs_grl <- result$orfs
+metrics <- result$metadata  # All RiboCode columns (pval, Psites, etc.)
+
+# Use ORFik functions on the unified output
+library(ORFik)
+orfs <- parse_orfs("ribocode.txt", source = "ribocode")
+# Calculate total ORF widths per group
+widths <- sum(width(orfs))
+# Extract start codons (requires genome/transcript sequences)
+# start_codons <- startCodons(orfs, faFile = "genome.fa")
 
 # Register and use a custom caller
 my_spec <- orf_caller_spec(

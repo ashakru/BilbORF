@@ -13,7 +13,8 @@ Imports:
     rtracklayer (>= 1.58.0),
     GenomeInfoDb (>= 1.34.9),
     GenomicFeatures (>= 1.50.4),
-    dplyr (>= 1.1.1)
+    dplyr (>= 1.1.1),
+    ORFik
 Suggests: 
     knitr,
     rmarkdown,
