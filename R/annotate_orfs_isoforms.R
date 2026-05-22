@@ -257,15 +257,15 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
     cli::cli_abort("{.arg orfs} must not be empty")
   }
 
-  # Helper: min/max genomic bounds per element of a GRangesList
+  # Helper: min/max genomic bounds per element of a GRangesList.
+  # range(grl) applies range() elementwise (C-level), giving one bounding
+  # GRanges per list element; unlist flattens to a flat GRanges.
   grl_bounds <- function(grl) {
-    ul  <- unlist(grl, use.names = FALSE)
-    grp <- rep(seq_along(grl), elementNROWS(grl))
-    fst <- cumsum(c(1L, elementNROWS(grl)[-length(grl)]))
+    rng <- unlist(range(grl), use.names = FALSE)
     list(
-      seqnames = as.character(seqnames(ul)[fst]),
-      start    = as.integer(tapply(start(ul), grp, min)),
-      end      = as.integer(tapply(end(ul),   grp, max))
+      seqnames = as.character(seqnames(rng)),
+      start    = as.integer(start(rng)),
+      end      = as.integer(end(rng))
     )
   }
 
@@ -339,12 +339,13 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
   genomic_st <- bc$start
   genomic_en <- bc$end
 
-  # Strand for each ORF-tx pair (all exons share the same strand)
-  strands_vec <- suppressWarnings(
-    vapply(seq_len(length(orf_in_tx)),
-           function(i) as.character(strand(orf_in_tx[[i]])[1L]),
-           character(1L))
-  )
+  # Strand for each ORF-tx pair: unlist once and index into the first exon of
+  # each element (all exons in a pair share the same strand).
+  strands_vec <- suppressWarnings({
+    ul_s      <- as.character(strand(unlist(orf_in_tx, use.names = FALSE)))
+    first_idx <- cumsum(c(1L, elementNROWS(orf_in_tx)[-length(orf_in_tx)]))
+    ul_s[first_idx]
+  })
 
   # --- Optional: downstream stop codon check ---
   downstream_codon_vec   <- rep(NA_character_, length(orf_in_tx))
@@ -352,21 +353,85 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
   stop_codon_end_vec     <- rep(NA_integer_,    length(orf_in_tx))
 
   if (check_stop_codon) {
-    ds_gr_list <- suppressWarnings(
-      mapply(.get_downstream_nt,
-             as.list(orf_in_tx), as.list(tx_by_orf),
-             MoreArgs = list(n = 3L), SIMPLIFY = FALSE)
+    # --- Vectorised downstream stop codon check ---
+    # Key insight: extract full transcript sequence once per unique transcript,
+    # then downstream codon = substr(tx_seq, orf_end_in_tx + 1, orf_end_in_tx + 3).
+    # Cost: one extractTranscriptSeqs call + O(n_unique_tx) coordinate work.
+
+    # 1. Deduplicated transcript GRangesList (one entry per unique tx ID)
+    unique_tx_names <- unique(names(tx_by_orf))
+    first_occ       <- match(unique_tx_names, names(tx_by_orf))
+    tx_grl_unique   <- tx_by_orf[first_occ]
+    names(tx_grl_unique) <- unique_tx_names
+
+    # 2. Full transcript sequences — single BSgenome query
+    tx_seqs_full <- suppressWarnings(
+      as.character(extractTranscriptSeqs(BSgenome, tx_grl_unique))
     )
-    has_ds <- lengths(ds_gr_list) > 0L
-    if (any(has_ds)) {
-      ds_grl  <- GRangesList(ds_gr_list[has_ds])
-      ds_seqs <- as.character(extractTranscriptSeqs(BSgenome, ds_grl))
-      downstream_codon_vec[has_ds]   <- ds_seqs
-      downstream_is_stop_vec[has_ds] <- ds_seqs %in% stop_codons
-      for (i in which(has_ds)) {
-        gr <- ds_gr_list[[i]]
-        stop_codon_end_vec[i] <-
-          if (suppressWarnings(as.character(strand(gr)[1L])) == "+") max(end(gr)) else min(start(gr))
+    names(tx_seqs_full) <- unique_tx_names
+
+    # 3. Vectorised ORF 5' position in transcript coordinates.
+    #    Use split() for O(n) grouping instead of which()==tid per transcript.
+    orf_5p_g_all  <- ifelse(strands_vec == "+", genomic_st, genomic_en)
+    orf_5p_tx_all <- rep(NA_integer_, length(orf_in_tx))
+    tx_groups     <- split(seq_along(orf_in_tx), names(tx_by_orf))
+
+    for (tid in names(tx_groups)) {
+      idx   <- tx_groups[[tid]]
+      strnd <- strands_vec[idx[1L]]
+      tx_ex <- tx_grl_unique[[tid]]
+      mcols(tx_ex) <- NULL
+      orf_5p_tx_all[idx] <- .genomic_5prime_to_tx_coord_vec(
+        orf_5p_g_all[idx], tx_ex, strnd
+      )
+    }
+
+    # 4. substr-based downstream codon (1-based R indexing)
+    #    orf_5p_tx_all is 0-based; ORF occupies positions [orf_5p_tx, orf_5p_tx+len)
+    #    downstream starts at position orf_5p_tx + len (0-based) = +1 in 1-based
+    len_nt_check  <- nchar(seq_nt_chr)
+    ds_start_1b   <- orf_5p_tx_all + len_nt_check + 1L   # 1-based start
+    ds_end_1b     <- ds_start_1b + 2L                    # 1-based end (3 nt)
+
+    tx_seq_per_orf <- tx_seqs_full[names(tx_by_orf)]
+    tx_len_per_orf <- nchar(tx_seq_per_orf)
+    valid_ds       <- !is.na(orf_5p_tx_all) & ds_end_1b <= tx_len_per_orf
+
+    if (any(valid_ds)) {
+      downstream_codon_vec[valid_ds] <- substr(
+        tx_seq_per_orf[valid_ds], ds_start_1b[valid_ds], ds_end_1b[valid_ds]
+      )
+      downstream_is_stop_vec[valid_ds] <-
+        downstream_codon_vec[valid_ds] %in% stop_codons
+    }
+
+    # 5. stop_codon_end: genomic coordinate of the 3'-most base of the
+    #    downstream codon.  Convert 0-based tx coord (ds_end_1b - 1) back to
+    #    genomic using sorted exon structure — no BSgenome access needed.
+    ds_end_0b <- ds_end_1b - 1L   # 0-based position of last ds nt in tx
+
+    for (tid in names(tx_groups)) {
+      idx        <- tx_groups[[tid]]
+      valid_here <- idx[valid_ds[idx]]
+      if (length(valid_here) == 0L) next
+
+      strnd <- strands_vec[valid_here[1L]]
+      tx_ex <- tx_grl_unique[[tid]]
+      mcols(tx_ex) <- NULL
+      tx_s  <- if (strnd == "+") sort(tx_ex) else rev(sort(tx_ex))
+      ex_w  <- as.integer(width(tx_s))
+      cum_b <- c(0L, cumsum(ex_w)[-length(ex_w)])
+
+      pos <- ds_end_0b[valid_here]
+      k   <- findInterval(pos, cum_b)
+      ok  <- k >= 1L & k <= length(tx_s)
+
+      if (strnd == "+") {
+        stop_codon_end_vec[valid_here[ok]] <-
+          as.integer(start(tx_s))[k[ok]] + (pos[ok] - cum_b[k[ok]])
+      } else {
+        stop_codon_end_vec[valid_here[ok]] <-
+          as.integer(end(tx_s))[k[ok]] - (pos[ok] - cum_b[k[ok]])
       }
     }
   }
@@ -535,56 +600,93 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
     # Index from ORF_isoform_id -> position in orf_in_tx / tx_by_orf
     pair_idx <- setNames(seq_along(orf_in_tx), names(orf_in_tx))
 
-    orf_status$overlaps_cds    <- NA
-    orf_status$pct_orf_in_cds  <- NA_real_
-    orf_status$pct_cds_in_orf  <- NA_real_
-    orf_status$cds_frame       <- NA_character_
+    orf_status$overlaps_cds   <- NA
+    orf_status$pct_orf_in_cds <- NA_real_
+    orf_status$pct_cds_in_orf <- NA_real_
+    orf_status$cds_frame      <- NA_character_
 
-    n_rows  <- nrow(orf_status)
-    pb      <- utils::txtProgressBar(min = 0, max = n_rows, style = 3)
-    on.exit(close(pb), add = TRUE)
-    for (row in seq_len(n_rows)) {
-      utils::setTxtProgressBar(pb, row)
-      iid <- orf_status$ORF_isoform_id[row]
-      i   <- pair_idx[iid]
-      if (is.na(i)) next            # intronic or no-transcript stub
+    # Map each row to its pair index (NA for intronic / no-transcript stubs)
+    row_pair_i <- pair_idx[orf_status$ORF_isoform_id]
+    valid_rows <- which(!is.na(row_pair_i))
+    orf_status$overlaps_cds[valid_rows] <- FALSE   # default for mapped rows
 
-      tx_id <- names(tx_by_orf)[i]
-      orf_status$overlaps_cds[row] <- FALSE   # default once transcript found
-      if (!tx_id %in% names(cds_gr)) next
+    tx_ids_valid <- names(tx_by_orf)[row_pair_i[valid_rows]]
+    has_cds_ann  <- tx_ids_valid %in% names(cds_gr)
+    valid_rows_c <- valid_rows[has_cds_ann]
+    tx_ids_c     <- tx_ids_valid[has_cds_ann]
+    pairs_i_c    <- row_pair_i[valid_rows_c]
 
-      cds_exons   <- cds_gr[[tx_id]]
-      orf_exons_i <- orf_in_tx[[i]]
-      tx_exons_i  <- tx_by_orf[[i]]
-      strnd       <- strands_vec[i]
+    if (length(valid_rows_c) > 0L) {
+      unique_tx <- unique(tx_ids_c)
 
-      # Exon-level overlap; pintersect gives bp overlap per hit
-      ov <- findOverlaps(orf_exons_i, cds_exons, ignore.strand = FALSE)
-      if (length(ov) == 0L) next
+      # Progress bar counts unique transcripts, not rows — much faster to tick
+      pb <- utils::txtProgressBar(min = 0, max = length(unique_tx), style = 3)
+      on.exit(close(pb), add = TRUE)
 
-      orf_status$overlaps_cds[row] <- TRUE
+      for (k in seq_along(unique_tx)) {
+        utils::setTxtProgressBar(pb, k)
+        tid <- unique_tx[k]
 
-      # Percentage overlap (splice-aware: use exonic bp, not genomic span)
-      overlap_bp <- sum(width(pintersect(
-        orf_exons_i[queryHits(ov)],
-        cds_exons[subjectHits(ov)]
-      )))
-      orf_bp <- sum(width(orf_exons_i))
-      cds_bp <- sum(width(cds_exons))
-      orf_status$pct_orf_in_cds[row] <- round(100 * overlap_bp / orf_bp, 2)
-      orf_status$pct_cds_in_orf[row] <- round(100 * overlap_bp / cds_bp, 2)
+        rows_k  <- valid_rows_c[tx_ids_c == tid]
+        pairs_k <- pairs_i_c[tx_ids_c == tid]
 
-      # Transcript-coordinate positions of the two 5' ends
-      orf_tx_coord <- .genomic_5prime_to_tx_coord(orf_exons_i, tx_exons_i, strnd)
-      cds_tx_coord <- .genomic_5prime_to_tx_coord(cds_exons,   tx_exons_i, strnd)
+        cds_exons  <- cds_gr[[tid]]
+        tx_exons_k <- tx_by_orf[[pairs_k[1L]]]   # same transcript for all in group
+        strnd_k    <- strands_vec[pairs_k[1L]]    # same strand for all in group
+        cds_bp_k   <- sum(width(cds_exons))
 
-      if (!is.na(orf_tx_coord) && !is.na(cds_tx_coord)) {
-        orf_status$cds_frame[row] <-
-          if ((orf_tx_coord - cds_tx_coord) %% 3L == 0L) "in_frame" else "out_of_frame"
+        # --- Overlap & percentages: one findOverlaps for all ORFs on this tx ---
+        orf_exons_list <- orf_in_tx[pairs_k]
+        orf_exons_flat <- unlist(orf_exons_list, use.names = FALSE)
+        mcols(orf_exons_flat) <- NULL
+        orf_grp <- rep(seq_along(pairs_k), elementNROWS(orf_exons_list))
+
+        # Exonic bp per ORF (denominator for pct_orf_in_cds)
+        orf_bp_per <- as.integer(tapply(width(orf_exons_flat), orf_grp, sum))
+
+        # Overlap with CDS exons
+        ov <- findOverlaps(orf_exons_flat, cds_exons, ignore.strand = FALSE)
+
+        olap_vec <- integer(length(pairs_k))   # 0 = no overlap
+        if (length(ov) > 0L) {
+          isect_w     <- width(pintersect(orf_exons_flat[queryHits(ov)],
+                                          cds_exons[subjectHits(ov)]))
+          olap_tbl    <- tapply(isect_w, orf_grp[queryHits(ov)], sum)
+          olap_vec[as.integer(names(olap_tbl))] <- as.integer(olap_tbl)
+        }
+
+        overlapping <- olap_vec > 0L
+        orf_status$overlaps_cds[rows_k[overlapping]]   <- TRUE
+        orf_status$pct_orf_in_cds[rows_k[overlapping]] <-
+          round(100 * olap_vec[overlapping] / orf_bp_per[overlapping], 2)
+        orf_status$pct_cds_in_orf[rows_k[overlapping]] <-
+          round(100 * olap_vec[overlapping] / cds_bp_k, 2)
+
+        # --- Frame check: cds_tx_coord computed once per transcript ---
+        cds_tx_coord_k <- .genomic_5prime_to_tx_coord(cds_exons, tx_exons_k, strnd_k)
+
+        if (!is.na(cds_tx_coord_k)) {
+          # Batch ORF 5' genomic positions using tapply on the already-flat vector
+          g_vec_k <- if (strnd_k == "+") {
+            as.integer(tapply(start(orf_exons_flat), orf_grp, min))
+          } else {
+            as.integer(tapply(end(orf_exons_flat),   orf_grp, max))
+          }
+
+          # Vectorised transcript-coordinate lookup (findInterval-based)
+          orf_tx_coords_k <- .genomic_5prime_to_tx_coord_vec(g_vec_k, tx_exons_k, strnd_k)
+
+          valid_frame <- !is.na(orf_tx_coords_k)
+          orf_status$cds_frame[rows_k[valid_frame]] <- ifelse(
+            (orf_tx_coords_k[valid_frame] - cds_tx_coord_k) %% 3L == 0L,
+            "in_frame", "out_of_frame"
+          )
+        }
       }
+
+      close(pb)
+      on.exit()   # clear safety handler after explicit close
     }
-    close(pb)
-    on.exit()    # clear the safety on.exit now we closed it explicitly
   }
 
   # --- Column order ---

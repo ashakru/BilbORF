@@ -217,6 +217,52 @@ rank_exons <- function(grl){
   }
 }
 
+# Vectorised version of .genomic_5prime_to_tx_coord.
+# g_vec  : integer vector of 5' genomic positions
+#           (min(start(orf_exons)) for "+", max(end(orf_exons)) for "-")
+# tx_exons: GRanges of transcript exons (any order; sorted internally)
+# strnd  : single string "+" or "-"
+# Returns an integer vector of 0-based transcript coordinates; NA where
+# g_vec falls outside all exons.
+#
+# Uses findInterval() for O(log n_exons) per query instead of a per-element
+# R loop, which matters when called for many ORFs on the same transcript.
+.genomic_5prime_to_tx_coord_vec <- function(g_vec, tx_exons, strnd) {
+  g_vec <- as.integer(g_vec)
+
+  if (strnd == "+") {
+    tx_s  <- sort(tx_exons)
+    ex_s  <- as.integer(start(tx_s))
+    ex_e  <- as.integer(end(tx_s))
+    ex_w  <- as.integer(width(tx_s))
+    cum_b <- c(0L, cumsum(ex_w)[-length(ex_w)])   # bases before each exon
+
+    # findInterval: k = last exon index where ex_s[k] <= g
+    k     <- findInterval(g_vec, ex_s)
+    valid <- k >= 1L & k <= length(ex_s) & g_vec <= ex_e[pmax(k, 1L)]
+    result <- rep(NA_integer_, length(g_vec))
+    result[valid] <- cum_b[k[valid]] + (g_vec[valid] - ex_s[k[valid]])
+
+  } else {
+    # "-" strand: tx_sorted descending (5'→3' in transcript coords)
+    tx_s  <- rev(sort(tx_exons))
+    ex_s  <- as.integer(start(tx_s))
+    ex_e  <- as.integer(end(tx_s))    # strictly DECREASING
+    ex_w  <- as.integer(width(tx_s))
+    cum_b <- c(0L, cumsum(ex_w)[-length(ex_w)])
+
+    # -ex_e is ASCENDING (ex_e is decreasing), so findInterval works directly.
+    # k = number of exons where ex_e >= g  (i.e., the exon CONTAINING g is at
+    # index k if ex_s[k] <= g).
+    k     <- findInterval(-g_vec, -ex_e)
+    valid <- k >= 1L & k <= length(ex_s) & ex_s[pmax(k, 1L)] <= g_vec
+    result <- rep(NA_integer_, length(g_vec))
+    result[valid] <- cum_b[k[valid]] + (ex_e[k[valid]] - g_vec[valid])
+  }
+
+  result
+}
+
 get_all_orfs <- function(gene_id, annotated_orfs_tab){
   annotated_orfs_tab[annotated_orfs_tab$gene_id == gene_id,]
 }
