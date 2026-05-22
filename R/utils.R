@@ -85,24 +85,136 @@ check_seq_levels <- function(x, y){
 #'
 #' @seealso \\code{\\link{annotate_orf_isoforms}} which uses this function internally
 rank_exons <- function(grl){
+  # endoapply preserves GRangesList structure (length, names, type) when
+  # applying a function to each element — safer than lapply + GRangesList().
+  endoapply(grl, function(x){
+    if (length(x) == 0) return(x)
+    str <- as.character(strand(x))
+    if (all(str == "-")) {
+      x$exon_rank <- rev(seq_along(x))
+    } else {
+      x$exon_rank <- seq_along(x)
+    }
+    x[order(x$exon_rank, decreasing = FALSE)]
+  })
+}
 
-    grl <- lapply(grl, function(x){
-      str <- as.character(strand(x))
-      if(all(str == "-")) {
-        x$exon_rank <- length(x):1
+#' Get downstream nucleotides after an ORF within a transcript
+#'
+#' Retrieves the \code{n} nucleotides immediately 3' of an ORF within the
+#' spliced structure of its transcript. Used to check whether the next codon
+#' after the ORF is a stop codon. Correctly handles exon-intron boundaries:
+#' if the ORF ends in one exon and the downstream nucleotides span into the
+#' next exon, both segments are returned as a multi-range GRanges.
+#'
+#' @param orf_exons GRanges of the ORF exonic segments (already intersected
+#'   with the transcript exons).
+#' @param tx_exons GRanges of the parent transcript's exons.
+#' @param n integer, number of nucleotides to retrieve. Default 3 (one codon).
+#'
+#' @return A GRanges with the genomic positions of the \code{n} downstream
+#'   nucleotides, or an empty GRanges if the transcript ends before \code{n}
+#'   nucleotides are available.
+#'
+#' @keywords internal
+.get_downstream_nt <- function(orf_exons, tx_exons, n = 3L) {
+  # Strip metadata so exons carried through the else-branch below don't inherit
+  # exon_rank (or any other mcols) from annotations$transcripts.  Without this,
+  # mixing bare GRanges() results (no mcols) with subsets of tx_exons (may have
+  # exon_rank, possibly NA) causes do.call(c, result) to produce a GRanges with
+  # an exon_rank column containing NAs, which triggers ORFik's check.
+  mcols(orf_exons) <- NULL
+  mcols(tx_exons)  <- NULL
+  strnd <- as.character(strand(orf_exons)[1L])
+
+  if (strnd %in% c("+", "*")) {
+    orf_3prime <- max(end(orf_exons))
+    # Transcript exons that extend beyond the ORF 3' end
+    ds_exons <- tx_exons[end(tx_exons) > orf_3prime]
+    if (length(ds_exons) == 0L) return(GRanges())
+    ds_exons <- sort(ds_exons)
+    # Clip any exon that overlaps the ORF to start just after the ORF ends
+    start(ds_exons) <- pmax(start(ds_exons), orf_3prime + 1L)
+    ds_exons <- ds_exons[width(ds_exons) > 0L]
+    if (length(ds_exons) == 0L) return(GRanges())
+
+    remaining <- n
+    result    <- list()
+    for (i in seq_along(ds_exons)) {
+      w <- width(ds_exons[i])
+      if (w >= remaining) {
+        result[[length(result) + 1L]] <- GRanges(
+          seqnames(ds_exons[i]),
+          IRanges(start(ds_exons[i]), start(ds_exons[i]) + remaining - 1L),
+          strand = strand(ds_exons[i])
+        )
+        remaining <- 0L
+        break
       } else {
-        x$exon_rank <- 1:length(x)
+        result[[length(result) + 1L]] <- ds_exons[i]
+        remaining <- remaining - w
       }
+    }
+    if (remaining > 0L) return(GRanges())   # transcript ends before n nt
+    do.call(c, result)
 
-      x <- x[order(x$exon_rank, decreasing = F)]
+  } else {   # "-" strand: 3' end of ORF is at the lowest genomic coordinate
+    orf_3prime <- min(start(orf_exons))
+    ds_exons   <- tx_exons[start(tx_exons) < orf_3prime]
+    if (length(ds_exons) == 0L) return(GRanges())
+    end(ds_exons) <- pmin(end(ds_exons), orf_3prime - 1L)
+    ds_exons <- ds_exons[width(ds_exons) > 0L]
+    if (length(ds_exons) == 0L) return(GRanges())
+    # Reverse: highest genomic position first = 5'→3' in transcript orientation
+    ds_exons <- rev(sort(ds_exons))
 
-      return(x)
-    })
+    remaining <- n
+    result    <- list()
+    for (i in seq_along(ds_exons)) {
+      w <- width(ds_exons[i])
+      if (w >= remaining) {
+        result[[length(result) + 1L]] <- GRanges(
+          seqnames(ds_exons[i]),
+          IRanges(end(ds_exons[i]) - remaining + 1L, end(ds_exons[i])),
+          strand = strand(ds_exons[i])
+        )
+        remaining <- 0L
+        break
+      } else {
+        result[[length(result) + 1L]] <- ds_exons[i]
+        remaining <- remaining - w
+      }
+    }
+    if (remaining > 0L) return(GRanges())
+    do.call(c, result)
+  }
+}
 
-  grl <- GRangesList(grl)
-
-  return(grl)
-
+# Returns the 0-based transcript coordinate of the 5'-most nucleotide of
+# query_exons (e.g. the start codon of an ORF or CDS), given the transcript's
+# exon structure tx_exons.  Splice junctions are handled correctly: only the
+# exonic bases are counted, so an ORF and a CDS lying in different exons will
+# have their true in-transcript distance reported.
+# Returns NA_integer_ if the 5' position falls outside all tx_exons.
+.genomic_5prime_to_tx_coord <- function(query_exons, tx_exons, strnd) {
+  if (strnd == "+") {
+    g         <- min(start(query_exons))
+    tx_sorted <- sort(tx_exons)
+    in_exon   <- start(tx_sorted) <= g & end(tx_sorted) >= g
+    if (!any(in_exon)) return(NA_integer_)
+    ex_idx       <- which(in_exon)[1L]
+    bases_before <- if (ex_idx > 1L) sum(width(tx_sorted[seq_len(ex_idx - 1L)])) else 0L
+    as.integer(bases_before + (g - start(tx_sorted[ex_idx])))
+  } else {
+    # "-" strand: 5' end is the highest genomic coordinate
+    g         <- max(end(query_exons))
+    tx_sorted <- rev(sort(tx_exons))   # descending order => first element = 5'-most
+    in_exon   <- start(tx_sorted) <= g & end(tx_sorted) >= g
+    if (!any(in_exon)) return(NA_integer_)
+    ex_idx       <- which(in_exon)[1L]
+    bases_before <- if (ex_idx > 1L) sum(width(tx_sorted[seq_len(ex_idx - 1L)])) else 0L
+    as.integer(bases_before + (end(tx_sorted[ex_idx]) - g))
+  }
 }
 
 get_all_orfs <- function(gene_id, annotated_orfs_tab){

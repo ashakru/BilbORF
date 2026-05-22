@@ -290,6 +290,16 @@ supported_orf_callers <- function() {
 #'   the unified GRanges and a data.frame of all caller-specific metrics.
 #' @param additional_cols Character vector of extra caller-specific columns
 #'   to retain. Only used when \code{output = "full"}.
+#' @param txdb Optional TxDb object or GRangesList of transcript exon structures.
+#'   Required for callers like RiboCode that need splicing-aware coordinate
+#'   adjustment. If NULL (default), genomic coordinate extension is used with
+#'   a warning for multi-exon ORFs. Can be created with
+#'   \code{GenomicFeatures::makeTxDbFromGFF()} or loaded from packages like
+#'   \code{TxDb.Hsapiens.UCSC.hg38.knownGene}.
+#' @param ribocode_extend_stop Logical. If \code{TRUE} (default), RiboCode
+#'   coordinates are extended by 3 nt to include the stop codon (RiboCode reports
+#'   coordinates excluding the stop codon). Set to \code{FALSE} to use
+#'   RiboCode's original coordinates without modification. Ignored for other callers.
 #'
 #' @return If \code{output = "unified"} (default), a GRanges with one range
 #'   per exon/segment and metadata columns: \code{orf_id} (unique identifier),
@@ -377,7 +387,9 @@ parse_orfs <- function(file,
                        genome_style    = "UCSC",
                        min_length      = NULL,
                        output          = c("unified", "full"),
-                       additional_cols = NULL) {
+                       additional_cols = NULL,
+                       txdb            = NULL,
+                       ribocode_extend_stop = TRUE) {
 
   # --- Validate inputs --------------------------------------------------------
   if (!file.exists(file)) stop("File not found: ", file)
@@ -396,10 +408,11 @@ parse_orfs <- function(file,
 
   # --- 4. Post-process --------------------------------------------------------
   if (!is.null(spec$post_process_fn)) {
+    # Post-process functions may need txdb for splicing-aware operations
     if (is.data.frame(raw)) {
-      gr <- spec$post_process_fn(gr, raw)
+      gr <- spec$post_process_fn(gr, raw, txdb, ribocode_extend_stop)
     } else {
-      gr <- spec$post_process_fn(gr, NULL)
+      gr <- spec$post_process_fn(gr, NULL, txdb, ribocode_extend_stop)
     }
   }
 
@@ -449,6 +462,801 @@ parse_orfs <- function(file,
   } else {
     return(.make_full_output(gr, raw))
   }
+}
+
+
+# ==============================================================================
+# Combine multiple ORF datasets
+# ==============================================================================
+
+#' Collapse ORF Calls from Multiple Datasets
+#'
+#' Takes a list of parsed ORF caller outputs (unified mode) and creates a
+#' combined GRanges with metadata columns indicating which datasets contain
+#' each ORF. This is useful for comparing ORF predictions across multiple
+#' samples, conditions, or replicates.
+#'
+#' @param orf_list A list of GRanges objects, typically from
+#'   \code{\link{parse_orfs}} with \code{output = "unified"}.
+#' @param dataset_names Optional character vector of names for each dataset.
+#'   If NULL, uses list names or generates "dataset_1", "dataset_2", etc.
+#' @param match_by How to determine if ORFs are "the same" across datasets:
+#'   \describe{
+#'     \item{coordinates}{ORFs must have identical genomic coordinates (default)}
+#'     \item{start_codon}{ORFs match if they have the same start position
+#'                        (seqnames, start, strand), ignoring transcript ID}
+#'     \item{start_codon_transcript}{ORFs match if they have the same start
+#'                                   position and transcript_id}
+#'     \item{stop_codon}{ORFs match if they have the same stop position
+#'                       (seqnames, end, strand), ignoring transcript ID}
+#'     \item{stop_codon_transcript}{ORFs match if they have the same stop
+#'                                  position and transcript_id}
+#'     \item{start_stop}{ORFs match if they have the same start and stop
+#'                       positions (seqnames, start, end, strand)}
+#'     \item{start_stop_transcript}{ORFs match if they have the same start, stop,
+#'                                  and transcript_id}
+#'     \item{overlap}{ORFs must overlap by at least \code{overlap_threshold}}
+#'     \item{metadata}{ORFs match if they have the same values for
+#'                     \code{metadata_keys} (e.g., same transcript + orf_type)}
+#'   }
+#' @param overlap_threshold Numeric in [0, 1]. For \code{match_by = "overlap"},
+#'   the minimum fraction of reciprocal overlap required (default: 0.9).
+#' @param metadata_keys Character vector of metadata column names to use for
+#'   matching when \code{match_by = "metadata"}. Default: c("transcript_id", "orf_type").
+#' @param combine How to combine ORFs across datasets:
+#'   \describe{
+#'     \item{union}{Return all unique ORFs from all datasets (default)}
+#'     \item{first}{Use first dataset as reference, add presence indicators}
+#'   }
+#' @param keep_orf_ids Logical. If TRUE, retain the ORF names and orf_id metadata
+#'   column from the input GRanges. If FALSE (default), drop both ORF names and
+#'   the orf_id column from the result, since combined ORFs from different datasets
+#'   may have conflicting IDs.
+#'
+#' @return A GRanges object with:
+#'   \itemize{
+#'     \item All metadata columns from the input GRanges
+#'     \item Additional logical columns named \code{in_<dataset_name>} indicating
+#'           presence in each dataset
+#'     \item \code{n_datasets}: Integer column with count of datasets containing
+#'           this ORF
+#'   }
+#'
+#' @examples
+#' \dontrun{
+#' # Parse ORFquant results from multiple samples
+#' orfquant_files <- c("sample1.rds", "sample2.rds", "sample3.rds")
+#' orfquant_orfs <- lapply(orfquant_files, function(f) {
+#'   parse_orfs(f, source = "orfquant", genome_style = "UCSC")
+#' })
+#' names(orfquant_orfs) <- c("control", "treatment_1", "treatment_2")
+#' 
+#' # Collapse by exact coordinates
+#' combined <- collapse_orf_calls(orfquant_orfs)
+#' 
+#' # See which ORFs are in all datasets
+#' table(combined$n_datasets)
+#' common_orfs <- combined[combined$n_datasets == 3]
+#' 
+#' # Keep original ORF IDs from input datasets
+#' combined_with_ids <- collapse_orf_calls(orfquant_orfs, keep_orf_ids = TRUE)
+#' head(names(combined_with_ids))  # Shows ORF IDs
+#' 
+#' # Match by start codon only (ignores transcript ID and stop differences)
+#' combined_start <- collapse_orf_calls(
+#'   orfquant_orfs,
+#'   match_by = "start_codon"
+#' )
+#' 
+#' # Match by start codon and transcript (allows stop codon differences)
+#' combined_start_tx <- collapse_orf_calls(
+#'   orfquant_orfs,
+#'   match_by = "start_codon_transcript"
+#' )
+#' 
+#' # Match by stop codon only
+#' combined_stop <- collapse_orf_calls(
+#'   orfquant_orfs,
+#'   match_by = "stop_codon"
+#' )
+#' 
+#' # Match by stop codon and transcript
+#' combined_stop_tx <- collapse_orf_calls(
+#'   orfquant_orfs,
+#'   match_by = "stop_codon_transcript"
+#' )
+#' 
+#' # Match by start and stop positions
+#' combined_start_stop <- collapse_orf_calls(
+#'   orfquant_orfs,
+#'   match_by = "start_stop"
+#' )
+#' 
+#' # Match by start, stop, and transcript ID
+#' combined_exact <- collapse_orf_calls(
+#'   orfquant_orfs,
+#'   match_by = "start_stop_transcript"
+#' )
+#' 
+#' # Collapse by overlap (allows slight coordinate differences)
+#' combined_overlap <- collapse_orf_calls(
+#'   orfquant_orfs,
+#'   match_by = "overlap",
+#'   overlap_threshold = 0.95
+#' )
+#' 
+#' # Collapse by metadata (same transcript + orf_type)
+#' combined_meta <- collapse_orf_calls(
+#'   orfquant_orfs,
+#'   match_by = "metadata",
+#'   metadata_keys = c("transcript_id", "orf_type")
+#' )
+#' }
+#'
+#' @export
+collapse_orf_calls <- function(orf_list,
+                                dataset_names = NULL,
+                                match_by = c("coordinates", "start_codon", "start_codon_transcript",
+                                            "stop_codon", "stop_codon_transcript",
+                                            "start_stop", "start_stop_transcript",
+                                            "overlap", "metadata"),
+                                overlap_threshold = 0.9,
+                                metadata_keys = c("transcript_id", "orf_type"),
+                                combine = c("union", "first"),
+                                keep_orf_ids = FALSE) {
+  
+  # --- 1. Input validation ----------------------------------------------------
+  if (!is.list(orf_list) || length(orf_list) < 1) {
+    stop("orf_list must be a list with at least one element")
+  }
+  
+  # Check all elements are GRanges
+  if (!all(vapply(orf_list, function(x) is(x, "GRanges"), logical(1)))) {
+    stop("All elements of orf_list must be GRanges objects")
+  }
+  
+  match_by <- match.arg(match_by)
+  combine <- match.arg(combine)
+  
+  # Handle dataset names (before early return for single dataset)
+  n_datasets <- length(orf_list)
+  if (is.null(dataset_names)) {
+    if (!is.null(names(orf_list))) {
+      dataset_names <- names(orf_list)
+    } else {
+      dataset_names <- paste0("dataset_", seq_len(n_datasets))
+    }
+  } else {
+    if (length(dataset_names) != n_datasets) {
+      stop("dataset_names must have the same length as orf_list")
+    }
+  }
+  
+  # Ensure valid R column names
+  dataset_names <- make.names(dataset_names, unique = TRUE)
+  
+  # Handle single dataset case
+  if (length(orf_list) == 1) {
+    warning("Only one dataset provided. Returning it with n_datasets = 1")
+    gr <- orf_list[[1]]
+    GenomicRanges::mcols(gr)$n_datasets <- 1L
+    col_name <- paste0("in_", dataset_names[1])
+    GenomicRanges::mcols(gr)[[col_name]] <- TRUE
+    # Drop ORF IDs if requested
+    if (!keep_orf_ids) {
+      names(gr) <- NULL
+      # Also remove orf_id column from metadata
+      if ("orf_id" %in% colnames(GenomicRanges::mcols(gr))) {
+        GenomicRanges::mcols(gr)$orf_id <- NULL
+      }
+    }
+    return(gr)
+  }
+  
+  # --- 2. Get base set of ORFs ------------------------------------------------
+  if (combine == "first") {
+    base_gr <- orf_list[[1]]
+  } else {  # union
+    # Combine all, keeping duplicates for now
+    base_gr <- do.call(c, unname(orf_list))
+  }
+  
+  # --- 3. Match ORFs across datasets ------------------------------------------
+  
+  # Initialize presence matrix
+  presence_matrix <- matrix(FALSE, nrow = length(base_gr), ncol = n_datasets)
+  colnames(presence_matrix) <- paste0("in_", dataset_names)
+  
+  if (match_by == "coordinates") {
+    # Exact coordinate matching
+    for (i in seq_len(n_datasets)) {
+      query_gr <- orf_list[[i]]
+      # Find exact matches
+      matches <- GenomicRanges::match(base_gr, query_gr)
+      presence_matrix[, i] <- !is.na(matches)
+    }
+    
+  } else if (match_by == "start_codon") {
+    # Match by start position only (seqnames + start + strand)
+    for (i in seq_len(n_datasets)) {
+      query_gr <- orf_list[[i]]
+      
+      # Create keys for start position
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::start(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        sep = "|"
+      )
+      
+      query_key <- paste(
+        as.character(GenomicRanges::seqnames(query_gr)),
+        GenomicRanges::start(query_gr),
+        as.character(GenomicRanges::strand(query_gr)),
+        sep = "|"
+      )
+      
+      # Match by key
+      matches <- match(base_key, query_key)
+      presence_matrix[, i] <- !is.na(matches)
+    }
+    
+  } else if (match_by == "start_codon_transcript") {
+    # Match by start position and transcript_id
+    # Check that transcript_id exists
+    if (!all(vapply(orf_list, function(gr) {
+      "transcript_id" %in% colnames(GenomicRanges::mcols(gr))
+    }, logical(1)))) {
+      stop("transcript_id not found in all datasets. Required for match_by='start_codon_transcript'")
+    }
+    
+    for (i in seq_len(n_datasets)) {
+      query_gr <- orf_list[[i]]
+      
+      # Create keys for start position and transcript
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::start(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        as.character(GenomicRanges::mcols(base_gr)$transcript_id),
+        sep = "|"
+      )
+      
+      query_key <- paste(
+        as.character(GenomicRanges::seqnames(query_gr)),
+        GenomicRanges::start(query_gr),
+        as.character(GenomicRanges::strand(query_gr)),
+        as.character(GenomicRanges::mcols(query_gr)$transcript_id),
+        sep = "|"
+      )
+      
+      # Match by key
+      matches <- match(base_key, query_key)
+      presence_matrix[, i] <- !is.na(matches)
+    }
+    
+  } else if (match_by == "stop_codon") {
+    # Match by stop position only (seqnames + end + strand)
+    for (i in seq_len(n_datasets)) {
+      query_gr <- orf_list[[i]]
+      
+      # Create keys for stop position
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::end(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        sep = "|"
+      )
+      
+      query_key <- paste(
+        as.character(GenomicRanges::seqnames(query_gr)),
+        GenomicRanges::end(query_gr),
+        as.character(GenomicRanges::strand(query_gr)),
+        sep = "|"
+      )
+      
+      # Match by key
+      matches <- match(base_key, query_key)
+      presence_matrix[, i] <- !is.na(matches)
+    }
+    
+  } else if (match_by == "stop_codon_transcript") {
+    # Match by stop position and transcript_id
+    # Check that transcript_id exists
+    if (!all(vapply(orf_list, function(gr) {
+      "transcript_id" %in% colnames(GenomicRanges::mcols(gr))
+    }, logical(1)))) {
+      stop("transcript_id not found in all datasets. Required for match_by='stop_codon_transcript'")
+    }
+    
+    for (i in seq_len(n_datasets)) {
+      query_gr <- orf_list[[i]]
+      
+      # Create keys for stop position and transcript
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::end(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        as.character(GenomicRanges::mcols(base_gr)$transcript_id),
+        sep = "|"
+      )
+      
+      query_key <- paste(
+        as.character(GenomicRanges::seqnames(query_gr)),
+        GenomicRanges::end(query_gr),
+        as.character(GenomicRanges::strand(query_gr)),
+        as.character(GenomicRanges::mcols(query_gr)$transcript_id),
+        sep = "|"
+      )
+      
+      # Match by key
+      matches <- match(base_key, query_key)
+      presence_matrix[, i] <- !is.na(matches)
+    }
+    
+  } else if (match_by == "start_stop") {
+    # Match by start and stop positions (seqnames + start + end + strand)
+    for (i in seq_len(n_datasets)) {
+      query_gr <- orf_list[[i]]
+      
+      # Create keys for start and stop positions
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::start(base_gr),
+        GenomicRanges::end(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        sep = "|"
+      )
+      
+      query_key <- paste(
+        as.character(GenomicRanges::seqnames(query_gr)),
+        GenomicRanges::start(query_gr),
+        GenomicRanges::end(query_gr),
+        as.character(GenomicRanges::strand(query_gr)),
+        sep = "|"
+      )
+      
+      # Match by key
+      matches <- match(base_key, query_key)
+      presence_matrix[, i] <- !is.na(matches)
+    }
+    
+  } else if (match_by == "start_stop_transcript") {
+    # Match by start, stop, and transcript_id
+    # Check that transcript_id exists
+    if (!all(vapply(orf_list, function(gr) {
+      "transcript_id" %in% colnames(GenomicRanges::mcols(gr))
+    }, logical(1)))) {
+      stop("transcript_id not found in all datasets. Required for match_by='start_stop_transcript'")
+    }
+    
+    for (i in seq_len(n_datasets)) {
+      query_gr <- orf_list[[i]]
+      
+      # Create keys for start, stop, and transcript
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::start(base_gr),
+        GenomicRanges::end(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        as.character(GenomicRanges::mcols(base_gr)$transcript_id),
+        sep = "|"
+      )
+      
+      query_key <- paste(
+        as.character(GenomicRanges::seqnames(query_gr)),
+        GenomicRanges::start(query_gr),
+        GenomicRanges::end(query_gr),
+        as.character(GenomicRanges::strand(query_gr)),
+        as.character(GenomicRanges::mcols(query_gr)$transcript_id),
+        sep = "|"
+      )
+      
+      # Match by key
+      matches <- match(base_key, query_key)
+      presence_matrix[, i] <- !is.na(matches)
+    }
+    
+  } else if (match_by == "overlap") {
+    # Overlap-based matching
+    for (i in seq_len(n_datasets)) {
+      query_gr <- orf_list[[i]]
+      # Find overlaps
+      hits <- GenomicRanges::findOverlaps(base_gr, query_gr)
+      
+      # Calculate reciprocal overlap
+      query_idx <- S4Vectors::subjectHits(hits)
+      base_idx <- S4Vectors::queryHits(hits)
+      
+      overlap_width <- IRanges::width(GenomicRanges::pintersect(
+        base_gr[base_idx], query_gr[query_idx]
+      ))
+      base_width <- IRanges::width(base_gr[base_idx])
+      query_width <- IRanges::width(query_gr[query_idx])
+      
+      # Reciprocal overlap fraction
+      overlap_frac <- pmin(overlap_width / base_width,
+                          overlap_width / query_width)
+      
+      # Mark as present if overlap threshold met
+      good_hits <- base_idx[overlap_frac >= overlap_threshold]
+      presence_matrix[unique(good_hits), i] <- TRUE
+    }
+    
+  } else {  # metadata
+    # Check metadata columns exist
+    for (key in metadata_keys) {
+      if (!all(vapply(orf_list, function(gr) {
+        key %in% colnames(GenomicRanges::mcols(gr))
+      }, logical(1)))) {
+        stop("metadata_key '", key, "' not found in all datasets")
+      }
+    }
+    
+    # Build metadata keys for each dataset
+    for (i in seq_len(n_datasets)) {
+      query_gr <- orf_list[[i]]
+      
+      # Create composite key for base and query
+      base_key <- do.call(paste, c(
+        lapply(metadata_keys, function(k) {
+          as.character(GenomicRanges::mcols(base_gr)[[k]])
+        }),
+        sep = "|"
+      ))
+      
+      query_key <- do.call(paste, c(
+        lapply(metadata_keys, function(k) {
+          as.character(GenomicRanges::mcols(query_gr)[[k]])
+        }),
+        sep = "|"
+      ))
+      
+      # Match by key
+      matches <- match(base_key, query_key)
+      presence_matrix[, i] <- !is.na(matches)
+    }
+  }
+  
+  # --- 4. Remove duplicates if combine = "union" ------------------------------
+  if (combine == "union") {
+    # Find unique ORFs based on match_by strategy
+    if (match_by == "coordinates") {
+      is_unique <- !duplicated(base_gr)
+      
+    } else if (match_by == "start_codon") {
+      # Unique by start position
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::start(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        sep = "|"
+      )
+      is_unique <- !duplicated(base_key)
+      
+    } else if (match_by == "start_codon_transcript") {
+      # Unique by start position and transcript
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::start(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        as.character(GenomicRanges::mcols(base_gr)$transcript_id),
+        sep = "|"
+      )
+      is_unique <- !duplicated(base_key)
+      
+    } else if (match_by == "stop_codon") {
+      # Unique by stop position
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::end(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        sep = "|"
+      )
+      is_unique <- !duplicated(base_key)
+      
+    } else if (match_by == "stop_codon_transcript") {
+      # Unique by stop position and transcript
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::end(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        as.character(GenomicRanges::mcols(base_gr)$transcript_id),
+        sep = "|"
+      )
+      is_unique <- !duplicated(base_key)
+      
+    } else if (match_by == "start_stop") {
+      # Unique by start and stop positions
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::start(base_gr),
+        GenomicRanges::end(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        sep = "|"
+      )
+      is_unique <- !duplicated(base_key)
+      
+    } else if (match_by == "start_stop_transcript") {
+      # Unique by start, stop, and transcript
+      base_key <- paste(
+        as.character(GenomicRanges::seqnames(base_gr)),
+        GenomicRanges::start(base_gr),
+        GenomicRanges::end(base_gr),
+        as.character(GenomicRanges::strand(base_gr)),
+        as.character(GenomicRanges::mcols(base_gr)$transcript_id),
+        sep = "|"
+      )
+      is_unique <- !duplicated(base_key)
+      
+    } else if (match_by == "overlap") {
+      # For overlap, need to group overlapping ORFs
+      # Use reduce-like approach: iteratively merge overlapping ORFs
+      hits <- GenomicRanges::findOverlaps(base_gr, base_gr)
+      query_idx <- S4Vectors::subjectHits(hits)
+      base_idx <- S4Vectors::queryHits(hits)
+      
+      overlap_width <- IRanges::width(GenomicRanges::pintersect(
+        base_gr[base_idx], base_gr[query_idx]
+      ))
+      base_width <- IRanges::width(base_gr[base_idx])
+      query_width <- IRanges::width(base_gr[query_idx])
+      
+      overlap_frac <- pmin(overlap_width / base_width,
+                          overlap_width / query_width)
+      
+      # Build equivalence groups
+      good_pairs <- hits[overlap_frac >= overlap_threshold]
+      
+      # Use first occurrence of each group
+      groups <- rep(seq_along(base_gr), each = 1)
+      for (i in seq_len(length(good_pairs))) {
+        q <- S4Vectors::queryHits(good_pairs)[i]
+        s <- S4Vectors::subjectHits(good_pairs)[i]
+        groups[s] <- min(groups[q], groups[s])
+      }
+      is_unique <- !duplicated(groups)
+      
+    } else {  # metadata
+      # Unique by metadata keys
+      base_key <- do.call(paste, c(
+        lapply(metadata_keys, function(k) {
+          as.character(GenomicRanges::mcols(base_gr)[[k]])
+        }),
+        sep = "|"
+      ))
+      is_unique <- !duplicated(base_key)
+    }
+    
+    base_gr <- base_gr[is_unique]
+    presence_matrix <- presence_matrix[is_unique, , drop = FALSE]
+  }
+  
+  # --- 5. Add metadata columns ------------------------------------------------
+  for (i in seq_len(n_datasets)) {
+    col_name <- colnames(presence_matrix)[i]
+    GenomicRanges::mcols(base_gr)[[col_name]] <- presence_matrix[, i]
+  }
+  
+  # Add n_datasets count
+  GenomicRanges::mcols(base_gr)$n_datasets <- as.integer(rowSums(presence_matrix))
+  
+  # Drop ORF IDs if requested
+  if (!keep_orf_ids) {
+    names(base_gr) <- NULL
+    # Also remove orf_id column from metadata
+    if ("orf_id" %in% colnames(GenomicRanges::mcols(base_gr))) {
+      GenomicRanges::mcols(base_gr)$orf_id <- NULL
+    }
+  }
+  
+  base_gr
+}
+
+
+# ==============================================================================
+# Export functions
+# ==============================================================================
+
+#' Export ORFs to BED12 with Spliced Exon Coordinates
+#'
+#' Maps parsed ORF predictions onto their canonical transcript's exon structure
+#' and writes a BED12 file using \code{ORFik::export.bed12}. Each ORF is
+#' represented as a multi-block entry that reflects the spliced exonic
+#' structure of its \code{transcript_id}.
+#'
+#' Mapping is fully vectorised using \code{ORFik::pmapToTranscriptF} (genomic
+#' to transcript space) and \code{ORFik::pmapFromTranscriptF} (transcript to
+#' spliced genomic space), avoiding any per-ORF loop.
+#'
+#' @param orfs A GRanges object from \code{\link{parse_orfs}} (unified output).
+#'   Must have a \code{transcript_id} metadata column.
+#' @param txdb A TxDb object (e.g. from
+#'   \code{GenomicFeatures::makeTxDbFromGFF()}) or a named GRangesList of
+#'   exon ranges grouped by transcript (e.g. from
+#'   \code{GenomicFeatures::exonsBy(txdb, by = "tx", use.names = TRUE)}).
+#'   Used to resolve the exon structure of each transcript.
+#' @param file Output file path (should end in \code{.bed}).
+#'
+#' @return Invisibly returns the GRangesList of spliced ORFs written to disk.
+#'
+#' @details
+#' The function first checks, vectorised via \code{findOverlaps}, whether each
+#' ORF's start and stop positions fall within the exons of its assigned
+#' \code{transcript_id}. For any ORF where they do not, it searches all
+#' transcripts in \code{txdb} for an isoform whose exons cover both endpoints
+#' and substitutes that isoform. If no compatible isoform exists, the ORF is
+#' kept but exported as flat unspliced genomic coordinates (a single BED12
+#' block). No ORFs are discarded. After re-assignment, a vectorised
+#' element-wise \code{GRangesList::intersect} clips each ORF to the exon
+#' blocks of its (possibly updated) transcript, and the result is written via
+#' \code{ORFik::export.bed12}.
+#'
+#' ORFs whose original \code{transcript_id} is absent from \code{txdb} are
+#' dropped with a warning (they cannot be mapped at all).
+#'
+#' @export
+#' @importFrom GenomicFeatures exonsBy
+#' @importFrom GenomicRanges GRanges GRangesList findOverlaps intersect mcols
+#' @importFrom IRanges IRanges
+#' @importFrom S4Vectors queryHits subjectHits
+#'
+#' @examples
+#' \dontrun{
+#' library(GenomicFeatures)
+#' txdb <- makeTxDbFromGFF("gencode.v35.annotation.gtf")
+#' orfs <- parse_orfs("ribotish_pred.txt", source = "ribotish")
+#' export_orfs_bed(orfs, txdb, "ribotish_orfs_spliced.bed")
+#' }
+#'
+#' @seealso \code{\link{parse_orfs}}, \code{ORFik::export.bed12},
+#'   \code{ORFik::pmapToTranscriptF}, \code{ORFik::pmapFromTranscriptF}
+export_orfs_bed <- function(orfs, txdb, file) {
+  if (!is(orfs, "GRanges")) {
+    stop("`orfs` must be a GRanges object from parse_orfs().")
+  }
+  if (!"transcript_id" %in% colnames(GenomicRanges::mcols(orfs))) {
+    stop("`orfs` must have a `transcript_id` metadata column.")
+  }
+  if (!is.character(file) || length(file) != 1) {
+    stop("`file` must be a single character string.")
+  }
+
+  # --- Resolve exon structure -------------------------------------------------
+  if (is(txdb, "TxDb")) {
+    tx_exons <- GenomicFeatures::exonsBy(txdb, by = "tx", use.names = TRUE)
+  } else if (is(txdb, "GRangesList")) {
+    tx_exons <- txdb
+  } else {
+    stop("`txdb` must be a TxDb object or a named GRangesList.")
+  }
+
+  # --- Filter to transcripts present in txdb ----------------------------------
+  tx_ids <- as.character(GenomicRanges::mcols(orfs)$transcript_id)
+  found  <- tx_ids %in% names(tx_exons)
+
+  if (!all(found)) {
+    warning(sum(!found), " ORF(s) dropped: transcript_id not found in txdb.")
+    orfs   <- orfs[found]
+    tx_ids <- tx_ids[found]
+  }
+
+  if (length(orfs) == 0) {
+    stop("No ORFs remain after filtering for known transcripts.")
+  }
+
+  # --- Resolve ORF names ------------------------------------------------------
+  orf_names <- names(orfs)
+  if (is.null(orf_names) || any(is.na(orf_names)) || any(orf_names == "")) {
+    id_col    <- GenomicRanges::mcols(orfs)$orf_id
+    orf_names <- if (!is.null(id_col)) as.character(id_col) else paste0("orf_", seq_along(orfs))
+  }
+
+  # Strip ORF metadata so intersection only sees coordinates
+  orfs_coords <- orfs
+  GenomicRanges::mcols(orfs_coords) <- NULL
+
+  # --- Check that ORF start & stop fall within their assigned transcript ------
+  # Build single-nucleotide markers for the ORF start and stop positions
+  orf_starts_gr <- GenomicRanges::GRanges(
+    GenomicRanges::seqnames(orfs_coords),
+    IRanges::IRanges(GenomicRanges::start(orfs_coords), width = 1L),
+    strand = GenomicRanges::strand(orfs_coords)
+  )
+  orf_stops_gr <- GenomicRanges::GRanges(
+    GenomicRanges::seqnames(orfs_coords),
+    IRanges::IRanges(GenomicRanges::end(orfs_coords), width = 1L),
+    strand = GenomicRanges::strand(orfs_coords)
+  )
+
+  # Flatten the parallel transcript exons; track which element each row belongs to
+  tx_par_init <- tx_exons[tx_ids]
+  tx_par_flat <- unlist(tx_par_init, use.names = FALSE)
+  tx_par_idx  <- rep(seq_along(tx_par_init), lengths(tx_par_init))
+
+  hs_par <- GenomicRanges::findOverlaps(orf_starts_gr, tx_par_flat, ignore.strand = FALSE)
+  he_par <- GenomicRanges::findOverlaps(orf_stops_gr,  tx_par_flat, ignore.strand = FALSE)
+
+  # A hit is "self-consistent" when the ORF index equals the transcript element index
+  valid_start <- seq_along(orfs_coords) %in%
+    S4Vectors::queryHits(hs_par)[S4Vectors::queryHits(hs_par) ==
+                                   tx_par_idx[S4Vectors::subjectHits(hs_par)]]
+  valid_stop  <- seq_along(orfs_coords) %in%
+    S4Vectors::queryHits(he_par)[S4Vectors::queryHits(he_par) ==
+                                   tx_par_idx[S4Vectors::subjectHits(he_par)]]
+
+  needs_remap <- !(valid_start & valid_stop)
+
+  # --- Re-assign transcript for ORFs that extend beyond their assigned tx -----
+  if (any(needs_remap)) {
+    message(sum(needs_remap), " ORF(s) extend beyond their assigned transcript; ",
+            "searching for a compatible isoform...")
+
+    # Flatten the full tx_exons catalogue once
+    tx_all_flat  <- unlist(tx_exons, use.names = FALSE)
+    tx_all_names <- rep(names(tx_exons), lengths(tx_exons))
+
+    remap_idx    <- which(needs_remap)
+    remap_starts <- orf_starts_gr[remap_idx]
+    remap_stops  <- orf_stops_gr[remap_idx]
+
+    # Find all transcripts whose exons cover each re-mapped ORF's start/stop
+    hs <- GenomicRanges::findOverlaps(remap_starts, tx_all_flat, ignore.strand = FALSE)
+    he <- GenomicRanges::findOverlaps(remap_stops,  tx_all_flat, ignore.strand = FALSE)
+
+    start_df <- data.frame(
+      orf_i = S4Vectors::queryHits(hs),
+      tx_id = tx_all_names[S4Vectors::subjectHits(hs)],
+      stringsAsFactors = FALSE
+    )
+    stop_df <- data.frame(
+      orf_i = S4Vectors::queryHits(he),
+      tx_id = tx_all_names[S4Vectors::subjectHits(he)],
+      stringsAsFactors = FALSE
+    )
+
+    # Keep only transcripts that cover both endpoints; take the first per ORF
+    both_df <- merge(start_df, stop_df, by = c("orf_i", "tx_id"))
+    best_df <- both_df[!duplicated(both_df$orf_i), ]
+
+    # Apply re-assignments
+    tx_ids[remap_idx[best_df$orf_i]] <- best_df$tx_id
+
+    # ORFs with no compatible isoform: flag for genomic (unspliced) fallback
+    genomic_fallback <- remap_idx[!seq_len(length(remap_idx)) %in% best_df$orf_i]
+    if (length(genomic_fallback) > 0) {
+      message(length(genomic_fallback),
+              " ORF(s) could not be matched to any compatible isoform; ",
+              "exporting as flat genomic (unspliced) coordinates.")
+    }
+  } else {
+    genomic_fallback <- integer(0)
+  }
+
+  # --- Build parallel transcript GRangesList (with any re-assignments) --------
+  tx_parallel <- tx_exons[tx_ids]
+
+  # Convert flat GRanges to GRangesList (one element per ORF) for vectorised
+  # element-wise intersection with tx_parallel
+  orfs_grl <- as(orfs_coords, "GRangesList")
+
+  # Vectorised element-wise intersection: keeps only exonic blocks of each ORF
+  spliced_list <- GenomicRanges::intersect(orfs_grl, tx_parallel,
+                                           ignore.strand = FALSE)
+
+  # Replace fallback entries with a single-block genomic range
+  if (length(genomic_fallback) > 0) {
+    for (i in genomic_fallback) {
+      spliced_list[[i]] <- orfs_coords[i]
+    }
+  }
+
+  names(spliced_list) <- orf_names
+
+  # --- Write BED12 via ORFik --------------------------------------------------
+  ORFik::export.bed12(spliced_list, file)
+  message("Exported ", length(spliced_list), " ORFs to ", file)
+  invisible(spliced_list)
 }
 
 
@@ -742,6 +1550,273 @@ parse_orfs <- function(file,
 
 
 # ==============================================================================
+# RiboCode-specific helpers
+# ==============================================================================
+
+#' Extend RiboCode ORF coordinates to include stop codon (simple genomic extension)
+#'
+#' RiboCode reports genomic coordinates excluding the stop codon.
+#' This function extends each ORF by 3 nucleotides in genomic space
+#' to include the stop codon (fast, but doesn't account for splicing).
+#'
+#' @param gr GRanges of ORFs
+#' @param raw_df Raw RiboCode data.frame (not currently used)
+#' @param txdb TxDb object (not used in simple version, kept for compatibility)
+#' @return GRanges with extended coordinates
+#' @keywords internal
+.extend_ribocode_stop_codon <- function(gr, raw_df, txdb) {
+  
+  # Simple genomic extension:
+  # Positive strand: decrease end by 3
+  # Negative strand: increase start by 3
+  is_plus <- as.character(GenomicRanges::strand(gr)) == "+"
+  
+  GenomicRanges::end(gr)[is_plus] <- GenomicRanges::end(gr)[is_plus] - 3L
+  GenomicRanges::start(gr)[!is_plus] <- GenomicRanges::start(gr)[!is_plus] + 3L
+  
+  return(gr)
+}
+
+
+# ==============================================================================
+# Validation and QC Functions
+# ==============================================================================
+
+#' Check Parsed ORF Caller Output
+#'
+#' Validates and summarizes the output from \code{\link{parse_orfs}}. Checks
+#' for common issues like invalid coordinates, missing metadata, NA values,
+#' and provides summary statistics.
+#'
+#' @param gr A GRanges object returned by \code{\link{parse_orfs}}.
+#' @param verbose Logical. If TRUE (default), print detailed validation report.
+#'   If FALSE, only return results invisibly.
+#' @param check_width Logical. If TRUE (default), check that all ORF widths
+#'   are multiples of 3 (expected for complete ORFs).
+#' @param check_seqlevels Logical. If TRUE (default), check for non-standard
+#'   chromosome names that might indicate genome version mismatches.
+#'
+#' @return Invisibly returns a list with validation results:
+#'   \describe{
+#'     \item{is_valid}{Logical. TRUE if all checks passed.}
+#'     \item{n_orfs}{Total number of ORFs.}
+#'     \item{issues}{Character vector of identified issues (empty if none).}
+#'     \item{warnings}{Character vector of warnings (empty if none).}
+#'     \item{summary}{Named list with summary statistics.}
+#'   }
+#'
+#' @export
+#' @examples
+#' \dontrun{
+#' # Parse ORFs from RiboTISH
+#' orfs <- parse_orfs("ribotish_output.txt", source = "ribotish")
+#'
+#' # Check the output
+#' check_orf_calls(orfs)
+#'
+#' # Run silently and capture results
+#' result <- check_orf_calls(orfs, verbose = FALSE)
+#' if (!result$is_valid) {
+#'   stop("ORF validation failed: ", paste(result$issues, collapse = "; "))
+#' }
+#' }
+check_orf_calls <- function(gr, verbose = TRUE, check_width = TRUE, 
+                           check_seqlevels = TRUE) {
+  
+  issues <- character(0)
+  warnings <- character(0)
+  
+  # --- Basic Structure Checks ---
+  if (!methods::is(gr, "GRanges")) {
+    stop("Input must be a GRanges object. Got: ", class(gr)[1])
+  }
+  
+  n_orfs <- length(gr)
+  
+  if (n_orfs == 0) {
+    issues <- c(issues, "Empty GRanges (0 ORFs)")
+  }
+  
+  # --- Coordinate Validation ---
+  if (n_orfs > 0) {
+    # Check for invalid ranges
+    if (any(GenomicRanges::width(gr) < 1)) {
+      n_invalid <- sum(GenomicRanges::width(gr) < 1)
+      issues <- c(issues, sprintf("%d ORF(s) have width < 1", n_invalid))
+    }
+    
+    # Check for unreasonably large ORFs (>50kb)
+    if (any(GenomicRanges::width(gr) > 50000)) {
+      n_large <- sum(GenomicRanges::width(gr) > 50000)
+      warnings <- c(warnings, sprintf("%d ORF(s) are >50kb (unusually large)", n_large))
+    }
+    
+    # Check for very small ORFs (<30nt = 10aa)
+    if (any(GenomicRanges::width(gr) < 30)) {
+      n_small <- sum(GenomicRanges::width(gr) < 30)
+      warnings <- c(warnings, sprintf("%d ORF(s) are <30nt (very short)", n_small))
+    }
+    
+    # Check if widths are multiples of 3
+    if (check_width && any(GenomicRanges::width(gr) %% 3 != 0)) {
+      n_not_mult3 <- sum(GenomicRanges::width(gr) %% 3 != 0)
+      warnings <- c(warnings, sprintf("%d ORF(s) have length not divisible by 3", n_not_mult3))
+    }
+  }
+  
+  # --- Strand Validation ---
+  if (n_orfs > 0) {
+    strands <- as.character(GenomicRanges::strand(gr))
+    n_unstranded <- sum(strands == "*")
+    if (n_unstranded > 0) {
+      warnings <- c(warnings, sprintf("%d ORF(s) have unspecified strand (*)", n_unstranded))
+    }
+    
+    n_invalid_strand <- sum(!strands %in% c("+", "-", "*"))
+    if (n_invalid_strand > 0) {
+      issues <- c(issues, sprintf("%d ORF(s) have invalid strand", n_invalid_strand))
+    }
+  }
+  
+  # --- Seqlevel Checks ---
+  if (n_orfs > 0 && check_seqlevels) {
+    seqlevels <- GenomicRanges::seqlevels(gr)
+    
+    # Check for common issues
+    has_chr_prefix <- any(grepl("^chr", seqlevels))
+    has_no_chr_prefix <- any(!grepl("^chr", seqlevels) & !grepl("^scaffold|^contig", seqlevels))
+    
+    if (has_chr_prefix && has_no_chr_prefix) {
+      warnings <- c(warnings, "Mixed chromosome naming (some with 'chr' prefix, some without)")
+    }
+    
+    # Check for unusual names
+    unusual <- seqlevels[grepl("^Un|_random|_alt|_fix", seqlevels)]
+    if (length(unusual) > 0) {
+      warnings <- c(warnings, sprintf("ORFs on %d unusual chromosome(s): %s", 
+                                     length(unusual), paste(head(unusual, 3), collapse = ", ")))
+    }
+  }
+  
+  # --- Metadata Validation ---
+  if (n_orfs > 0) {
+    mcols_df <- as.data.frame(GenomicRanges::mcols(gr))
+    
+    if (ncol(mcols_df) == 0) {
+      warnings <- c(warnings, "No metadata columns present")
+    } else {
+      # Check for NA values in key columns
+      key_cols <- c("orf_id", "transcript_id", "gene_id", "orf_type")
+      present_key_cols <- intersect(key_cols, colnames(mcols_df))
+      
+      for (col in present_key_cols) {
+        n_na <- sum(is.na(mcols_df[[col]]))
+        if (n_na > 0) {
+          pct <- round(100 * n_na / n_orfs, 1)
+          warnings <- c(warnings, sprintf("%d (%s%%) ORF(s) have NA in '%s'", n_na, pct, col))
+        }
+      }
+      
+      # Check for duplicate ORF IDs
+      if ("orf_id" %in% colnames(mcols_df)) {
+        orf_ids <- mcols_df$orf_id[!is.na(mcols_df$orf_id)]
+        n_dup <- sum(duplicated(orf_ids))
+        if (n_dup > 0) {
+          issues <- c(issues, sprintf("%d duplicate ORF ID(s)", n_dup))
+        }
+      }
+    }
+  }
+  
+  # --- Summary Statistics ---
+  summary_stats <- list(
+    n_orfs = n_orfs,
+    n_chromosomes = length(GenomicRanges::seqlevels(gr))
+  )
+  
+  if (n_orfs > 0) {
+    summary_stats$width_range <- range(GenomicRanges::width(gr))
+    summary_stats$width_median <- median(GenomicRanges::width(gr))
+    summary_stats$strand_counts <- table(as.character(GenomicRanges::strand(gr)))
+    
+    mcols_df <- as.data.frame(GenomicRanges::mcols(gr))
+    if ("orf_type" %in% colnames(mcols_df)) {
+      summary_stats$orf_type_counts <- table(mcols_df$orf_type, useNA = "ifany")
+    }
+    if ("transcript_id" %in% colnames(mcols_df)) {
+      n_unique_tx <- length(unique(mcols_df$transcript_id[!is.na(mcols_df$transcript_id)]))
+      summary_stats$n_unique_transcripts <- n_unique_tx
+      summary_stats$orfs_per_transcript <- round(n_orfs / n_unique_tx, 2)
+    }
+  }
+  
+  # --- Determine Overall Status ---
+  is_valid <- length(issues) == 0
+  
+  # --- Print Report ---
+  if (verbose) {
+    cat("\n")
+    cat("========================================\n")
+    cat("  ORF Caller Output Validation Report\n")
+    cat("========================================\n\n")
+    
+    cat("Total ORFs:", n_orfs, "\n")
+    if (n_orfs > 0) {
+      cat("Chromosomes:", summary_stats$n_chromosomes, "\n")
+      cat("Width range:", summary_stats$width_range[1], "-", summary_stats$width_range[2], "nt\n")
+      cat("Median width:", summary_stats$width_median, "nt\n")
+      
+      cat("\nStrand distribution:\n")
+      print(summary_stats$strand_counts)
+      
+      if (!is.null(summary_stats$orf_type_counts)) {
+        cat("\nORF type distribution:\n")
+        print(summary_stats$orf_type_counts)
+      }
+      
+      if (!is.null(summary_stats$n_unique_transcripts)) {
+        cat("\nUnique transcripts:", summary_stats$n_unique_transcripts, "\n")
+        cat("ORFs per transcript:", summary_stats$orfs_per_transcript, "\n")
+      }
+    }
+    
+    cat("\n")
+    if (is_valid && length(warnings) == 0) {
+      cat("✓ All validation checks passed!\n")
+    } else {
+      if (length(issues) > 0) {
+        cat("✗ ISSUES FOUND:\n")
+        for (issue in issues) {
+          cat("  •", issue, "\n")
+        }
+        cat("\n")
+      }
+      
+      if (length(warnings) > 0) {
+        cat("⚠ WARNINGS:\n")
+        for (warn in warnings) {
+          cat("  •", warn, "\n")
+        }
+        cat("\n")
+      }
+    }
+    cat("========================================\n\n")
+  }
+  
+  # --- Return Results ---
+  result <- list(
+    is_valid = is_valid,
+    n_orfs = n_orfs,
+    issues = issues,
+    warnings = warnings,
+    summary = summary_stats
+  )
+  
+  invisible(result)
+}
+
+
+# ==============================================================================
 # Built-in ORF Caller Specs
 # ==============================================================================
 
@@ -812,7 +1887,19 @@ parse_orfs <- function(file,
     ),
     coord_system = "1-based",
     url          = "https://github.com/xryanglab/RiboCode",
-    extra_cols   = c("ORF_length", "pval")
+    extra_cols   = c("ORF_length", "pval"),
+    post_process_fn = function(gr, raw_df, txdb = NULL, ribocode_extend_stop = TRUE) {
+      # RiboCode excludes the stop codon.
+      # We extend by 3 nt in genomic space to include it.
+      
+      # Skip extension if disabled
+      if (!ribocode_extend_stop) {
+        return(gr)
+      }
+      
+      # Simple genomic extension (fast, no txdb required)
+      .extend_ribocode_stop_codon(gr, raw_df, txdb)
+    }
   ))
 
   # ---------- PRICE -----------------------------------------------------------
@@ -863,6 +1950,22 @@ parse_orfs <- function(file,
   ))
 
   # ---------- ORFquant --------------------------------------------------------
+
+  # Helper: collapse a GRangesList (one element per ORF, each with >= 1 exon)
+  # into a flat GRanges with one row per ORF using the full genomic span
+  # (min start to max end). ORF-level metadata is taken from the first exon of
+  # each element, since all exons share the same ORF-level attributes.
+  # This ensures one row per ORF, consistent with single-range callers.
+  .orfquant_grl_to_span <- function(grl) {
+    span   <- unlist(range(grl), use.names = TRUE)
+    n      <- S4Vectors::elementNROWS(grl)
+    first  <- cumsum(n) - n + 1L
+    flat   <- unlist(grl, use.names = FALSE)
+    GenomicRanges::mcols(span) <- GenomicRanges::mcols(flat)[first, , drop = FALSE]
+    GenomicRanges::mcols(span)$orf_id <- names(span)
+    span
+  }
+
   register_orf_caller(orf_caller_spec(
     name        = "orfquant",
     description = "ORFquant: Quantifying translation from Ribo-seq",
@@ -882,7 +1985,7 @@ parse_orfs <- function(file,
     url          = "https://github.com/lcalviell/ORFquant",
     extra_cols   = c("P_sites_raw", "P_sites_raw_uniq", "pval", 
                      "ORF_category_Tx", "ORF_category_Tx_compatible", "ORF_category_Gen"),
-    post_process_fn = function(gr, raw_data) {
+    post_process_fn = function(gr, raw_data, txdb = NULL, ribocode_extend_stop = TRUE) {
       # For ORFquant GRanges from ORFs_gen or ORFs_tx, ensure orf_type is set
       # Check both ORF_category_Tx and ORF_category_Gen
       gr_mcols <- GenomicRanges::mcols(gr)
@@ -895,6 +1998,22 @@ parse_orfs <- function(file,
           GenomicRanges::mcols(gr)$orf_type <- as.character(gr_mcols$ORF_category_Gen)
         }
       }
+
+      # ORFs_gen has one row per exon block; collapse to one row per ORF using
+      # the full genomic span (min start to max end), carrying metadata from the
+      # first exon of each ORF.
+      orf_ids <- if ("orf_id" %in% colnames(GenomicRanges::mcols(gr))) {
+        GenomicRanges::mcols(gr)$orf_id
+      } else {
+        names(gr)
+      }
+      if (!is.null(orf_ids) && any(duplicated(orf_ids))) {
+        # S4Vectors::split uses PartitioningByEnd internally — faster than
+        # base split() for large S4 GRanges objects.
+        grl <- S4Vectors::split(gr, orf_ids)
+        gr <- .orfquant_grl_to_span(grl)
+      }
+
       gr
     },
     read_fn = function(file) {
@@ -949,11 +2068,14 @@ parse_orfs <- function(file,
                 tx_orf_ids <- tx_metadata[[tx_orf_col]]
                 match_idx <- match(gen_orf_ids, tx_orf_ids)
                 
-                # Copy metadata columns directly from tx to gen
-                for (col in metadata_cols) {
-                  if (col %in% colnames(tx_metadata)) {
-                    GenomicRanges::mcols(gen)[[col]] <- tx_metadata[[col]][match_idx]
-                  }
+                # Bulk-assign all metadata columns at once via cbind on the DataFrame
+                # to avoid repeated copy-on-modify from column-by-column assignment.
+                cols_to_add <- intersect(metadata_cols, colnames(tx_metadata))
+                if (length(cols_to_add) > 0) {
+                  GenomicRanges::mcols(gen) <- cbind(
+                    GenomicRanges::mcols(gen),
+                    tx_metadata[match_idx, cols_to_add, drop = FALSE]
+                  )
                 }
                 
                 # Set orf_type from category columns
@@ -980,9 +2102,7 @@ parse_orfs <- function(file,
             if (is.null(tx)) {
               # Handle standalone gen (which is actually ORFs_tx)
               if (is(gen, "GRangesList")) {
-                orf_ids_gen <- rep(names(gen), elementNROWS(gen))
-                gen <- unlist(gen, use.names = FALSE)
-                GenomicRanges::mcols(gen)$orf_id <- orf_ids_gen
+                gen <- .orfquant_grl_to_span(gen)
               } else {
                 # Standardize orf_id column name
                 gen_mcols_cols <- colnames(GenomicRanges::mcols(gen))
@@ -1017,21 +2137,13 @@ parse_orfs <- function(file,
             # If we reach here, we have both gen and tx with metadata columns to merge
             # (This handles the case where ORFs_gen has metadata in columns)
             
-            # If GRangesList, unlist and propagate names as orf_id
+            # If GRangesList, collapse to one span per ORF
             if (is(gen, "GRangesList")) {
-              orf_ids_gen <- rep(names(gen), elementNROWS(gen))
-              gen <- unlist(gen, use.names = FALSE)
-              if (is.null(GenomicRanges::mcols(gen)$orf_id)) {
-                GenomicRanges::mcols(gen)$orf_id <- orf_ids_gen
-              }
+              gen <- .orfquant_grl_to_span(gen)
             }
             
             if (is(tx, "GRangesList")) {
-              orf_ids_tx <- rep(names(tx), elementNROWS(tx))
-              tx <- unlist(tx, use.names = FALSE)
-              if (is.null(GenomicRanges::mcols(tx)$orf_id)) {
-                GenomicRanges::mcols(tx)$orf_id <- orf_ids_tx
-              }
+              tx <- .orfquant_grl_to_span(tx)
             }
             
             # ORFs_gen has genomic coords but minimal metadata
@@ -1057,12 +2169,14 @@ parse_orfs <- function(file,
               tx_orf_ids <- tx_metadata[[tx_orf_col]]
               match_idx <- match(gen_orf_ids, tx_orf_ids)
               
-              # Directly copy metadata columns from tx to gen (avoid data.frame conversion for complex types)
-              for (col in metadata_cols) {
-                if (col %in% colnames(tx_metadata)) {
-                  # Copy the column directly, preserving complex types
-                  GenomicRanges::mcols(gen)[[col]] <- tx_metadata[[col]][match_idx]
-                }
+              # Bulk-assign all metadata columns at once via cbind on the DataFrame
+              # to avoid repeated copy-on-modify from column-by-column assignment.
+              cols_to_add <- intersect(metadata_cols, colnames(tx_metadata))
+              if (length(cols_to_add) > 0) {
+                GenomicRanges::mcols(gen) <- cbind(
+                  GenomicRanges::mcols(gen),
+                  tx_metadata[match_idx, cols_to_add, drop = FALSE]
+                )
               }
               
               # Ensure standard orf_id column exists (use the one from gen)
@@ -1096,11 +2210,9 @@ parse_orfs <- function(file,
             # Only genomic coords available - standardize orf_id column name
             gen <- res$ORFs_gen
             
-            # If GRangesList, unlist and propagate names as orf_id
+            # If GRangesList, collapse to one span per ORF
             if (is(gen, "GRangesList")) {
-              orf_ids_gen <- rep(names(gen), elementNROWS(gen))
-              gen <- unlist(gen, use.names = FALSE)
-              GenomicRanges::mcols(gen)$orf_id <- orf_ids_gen
+              gen <- .orfquant_grl_to_span(gen)
             } else {
               # Handle regular GRanges
               gen_mcols <- colnames(GenomicRanges::mcols(gen))
@@ -1138,11 +2250,9 @@ parse_orfs <- function(file,
             
             tx <- res$ORFs_tx
             
-            # If GRangesList, unlist and propagate names as orf_id
+            # If GRangesList, collapse to one span per ORF
             if (is(tx, "GRangesList")) {
-              orf_ids_tx <- rep(names(tx), elementNROWS(tx))
-              tx <- unlist(tx, use.names = FALSE)
-              GenomicRanges::mcols(tx)$orf_id <- orf_ids_tx
+              tx <- .orfquant_grl_to_span(tx)
             } else {
               # Handle regular GRanges
               tx_mcols <- colnames(GenomicRanges::mcols(tx))
@@ -1238,7 +2348,7 @@ parse_orfs <- function(file,
     ),
     coord_system = "0-based",
     url          = "https://www.gencodegenes.org/pages/riboseq_orfs/",
-    post_process_fn = function(gr, raw_df) {
+    post_process_fn = function(gr, raw_df, txdb = NULL, ribocode_extend_stop = TRUE) {
       GenomicRanges::mcols(gr)$orf_type <- "ribo-seq_orf"
       gr
     }

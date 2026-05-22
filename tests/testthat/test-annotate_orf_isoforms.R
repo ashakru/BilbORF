@@ -51,9 +51,9 @@ test_that("annotate_orf_isoforms correctly annotates ORFs", {
   expect_true(nrow(annotated_orfs$table) > 0)
   
   # Test required columns
-  required_cols <- c("ORF_isoform_id", "ORF_id", "transcript_id", "gene_id", 
-                     "gene_name", "seq_nt", "seq_aa", "start_codon", 
-                     "stop_codon", "orf_status")
+  required_cols <- c("ORF_isoform_id", "ORF_id", "transcript_id", "gene_id",
+                     "gene_name", "seq_nt", "seq_aa", "len_nt", "len_aa",
+                     "start_codon", "stop_codon", "orf_status", "complete_codons")
   expect_true(all(required_cols %in% colnames(annotated_orfs$table)))
   
   # Test ranges structure
@@ -62,9 +62,12 @@ test_that("annotate_orf_isoforms correctly annotates ORFs", {
   expect_true(all(names(annotated_orfs$ranges) %in% annotated_orfs$table$ORF_isoform_id))
   
   # Test ORF status categories
-  valid_statuses <- c("translatable", "internal_stop", "no_stop", 
-                      "no_start", "no_stop_no_start")
+  valid_statuses <- c("translatable", "internal_stop", "no_stop",
+                      "no_start", "no_stop_no_start", "intronic", "no_transcript")
   expect_true(all(annotated_orfs$table$orf_status %in% valid_statuses))
+
+  # Every input ORF must appear in the output at least once
+  expect_true(all(names(orfs) %in% annotated_orfs$table$ORF_id))
   
   # Test that translatable ORFs have valid start/stop codons
   translatable <- annotated_orfs$table[annotated_orfs$table$orf_status == "translatable", ]
@@ -170,18 +173,39 @@ test_that("annotate_orf_isoforms sequences are valid", {
     transcripts_meta
   )
   
+  # Stub rows (intronic / no_transcript) have no sequence — restrict checks to
+  # rows that have actual sequences
+  has_seq <- !is.na(annotated_orfs$table$seq_nt)
+
   # Check nucleotide sequences contain only valid bases
   valid_nt <- c("A", "T", "C", "G", "N")
-  nt_bases <- unique(unlist(strsplit(annotated_orfs$table$seq_nt, "")))
+  nt_bases <- unique(unlist(strsplit(annotated_orfs$table$seq_nt[has_seq], "")))
   expect_true(all(nt_bases %in% valid_nt))
-  
+
   # Check amino acid sequences contain only valid AAs
-  valid_aa <- c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N", 
+  valid_aa <- c("A", "C", "D", "E", "F", "G", "H", "I", "K", "L", "M", "N",
                 "P", "Q", "R", "S", "T", "V", "W", "Y", "*", "X")
-  aa_chars <- unique(unlist(strsplit(annotated_orfs$table$seq_aa, "")))
+  aa_chars <- unique(unlist(strsplit(annotated_orfs$table$seq_aa[has_seq], "")))
   expect_true(all(aa_chars %in% valid_aa))
-  
-  # Check length relationships
-  expect_true(all(annotated_orfs$table$len_nt == nchar(annotated_orfs$table$seq_nt)))
-  expect_true(all(annotated_orfs$table$len_aa <= nchar(annotated_orfs$table$seq_aa)))
+
+  # Check length relationships for rows with sequence
+  seq_rows <- annotated_orfs$table[has_seq, ]
+  expect_true(all(seq_rows$len_nt == nchar(seq_rows$seq_nt)))
+  expect_true(all(seq_rows$len_aa <= nchar(seq_rows$seq_aa)))
+
+  # complete_codons must be logical; NA only for stub rows
+  expect_type(annotated_orfs$table$complete_codons, "logical")
+  expect_true(all(is.na(annotated_orfs$table$complete_codons[!has_seq])))
+  expect_true(all(seq_rows$complete_codons == (seq_rows$len_nt %% 3 == 0)))
+
+  # translatable ORFs must have complete codons
+  translatable_rows <- annotated_orfs$table[
+    !is.na(annotated_orfs$table$orf_status) &
+    annotated_orfs$table$orf_status == "translatable", ]
+  if (nrow(translatable_rows) > 0) {
+    expect_true(all(translatable_rows$complete_codons))
+  }
+
+  # All input ORFs appear in the output
+  expect_true(all(names(orfs[1:10]) %in% annotated_orfs$table$ORF_id))
 })
