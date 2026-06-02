@@ -80,8 +80,8 @@ check_seq_levels <- function(x, y){
 #'                   strand = \"-\")
 #' grl_neg <- GRangesList(gene1 = tx_neg)
 #' ranked_neg <- rank_exons(grl_neg)
-#' ranked_neg$gene1$exon_rank  # 3, 2, 1 (then sorted to 1, 2, 3 by position)
-#' start(ranked_neg$gene1)     # 300, 200, 100 (sorted by rank)
+#' ranked_neg$gene1$exon_rank  # 1, 2, 3 (sorted by rank)
+#' start(ranked_neg$gene1)     # 300, 200, 100 (sorted 5' to 3' on - strand)
 #'
 #' @seealso \\code{\\link{annotate_orf_isoforms}} which uses this function internally
 rank_exons <- function(grl){
@@ -90,12 +90,13 @@ rank_exons <- function(grl){
   endoapply(grl, function(x){
     if (length(x) == 0) return(x)
     str <- as.character(strand(x))
-    if (all(str == "-")) {
-      x$exon_rank <- rev(seq_along(x))
-    } else {
-      x$exon_rank <- seq_along(x)
-    }
-    x[order(x$exon_rank, decreasing = FALSE)]
+    # Sort by genomic coordinate first so rank assignment is independent of
+    # input order. For - strand, highest coordinate is 5' (rank 1); for +
+    # strand, lowest coordinate is 5' (rank 1).
+    decreasing <- all(str == "-")
+    x <- x[order(start(x), decreasing = decreasing)]
+    x$exon_rank <- seq_along(x)
+    x
   })
 }
 
