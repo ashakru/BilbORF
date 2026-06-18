@@ -289,7 +289,8 @@ supported_orf_callers <- function() {
 #'   orf_width, orf_id); \code{"full"} returns a list with both
 #'   the unified GRanges and a data.frame of all caller-specific metrics.
 #' @param additional_cols Character vector of extra caller-specific columns
-#'   to retain. Only used when \code{output = "full"}.
+#'   to retain in the output. Columns are included in both \code{"unified"}
+#'   and \code{"full"} output modes.
 #' @param txdb Optional TxDb object or GRangesList of transcript exon structures.
 #'   Required for callers like RiboCode that need splicing-aware coordinate
 #'   adjustment. If NULL (default), genomic coordinate extension is used with
@@ -417,11 +418,12 @@ parse_orfs <- function(file,
   }
 
   # --- 4.5. Strip metadata early for unified output (performance optimization) --
-  # For unified output, we only need transcript_id, orf_type, orf_id
+  # For unified output, we only need transcript_id, orf_type, orf_id (+ any
+  # additional_cols requested by the user).
   # Stripping unnecessary columns (especially complex types like CompressedLists)
   # before genome style conversion significantly improves performance
   if (output == "unified") {
-    cols_to_keep <- c("transcript_id", "orf_type", "orf_id")
+    cols_to_keep <- c("transcript_id", "orf_type", "orf_id", additional_cols)
     existing_cols <- cols_to_keep[cols_to_keep %in% colnames(GenomicRanges::mcols(gr))]
     if (length(existing_cols) > 0 && length(existing_cols) < ncol(GenomicRanges::mcols(gr))) {
       GenomicRanges::mcols(gr) <- GenomicRanges::mcols(gr)[, existing_cols, drop = FALSE]
@@ -458,7 +460,7 @@ parse_orfs <- function(file,
 
   # --- 8. Format output -------------------------------------------------------
   if (output == "unified") {
-    return(.make_unified_output(gr))
+    return(.make_unified_output(gr, additional_cols))
   } else {
     return(.make_full_output(gr, raw))
   }
@@ -1033,21 +1035,24 @@ collapse_orf_calls <- function(orf_list,
   }
   
   # --- 5. Add metadata columns ------------------------------------------------
+  # Retain only transcript_id and orf_type from the source data; all other
+  # per-dataset metadata is dropped to avoid implying it represents the combined call.
+  standard_cols <- c("transcript_id", "orf_type")
+  if (keep_orf_ids) standard_cols <- c(standard_cols, "orf_id")
+  keep_cols <- intersect(standard_cols, colnames(GenomicRanges::mcols(base_gr)))
+  GenomicRanges::mcols(base_gr) <- GenomicRanges::mcols(base_gr)[, keep_cols, drop = FALSE]
+
   for (i in seq_len(n_datasets)) {
     col_name <- colnames(presence_matrix)[i]
     GenomicRanges::mcols(base_gr)[[col_name]] <- presence_matrix[, i]
   }
-  
+
   # Add n_datasets count
   GenomicRanges::mcols(base_gr)$n_datasets <- as.integer(rowSums(presence_matrix))
-  
+
   # Drop ORF IDs if requested
   if (!keep_orf_ids) {
     names(base_gr) <- NULL
-    # Also remove orf_id column from metadata
-    if ("orf_id" %in% colnames(GenomicRanges::mcols(base_gr))) {
-      GenomicRanges::mcols(base_gr)$orf_id <- NULL
-    }
   }
   
   base_gr
@@ -1266,9 +1271,9 @@ export_orfs_bed <- function(orfs, txdb, file) {
 
 #' Create unified output (GRanges with core metadata)
 #' @keywords internal
-.make_unified_output <- function(gr) {
-  # Keep only essential metadata columns
-  mcols_to_keep <- c("orf_id", "transcript_id", "orf_type")
+.make_unified_output <- function(gr, additional_cols = NULL) {
+  # Keep only essential metadata columns (plus any user-requested additional_cols)
+  mcols_to_keep <- c("orf_id", "transcript_id", "orf_type", additional_cols)
   existing_cols <- mcols_to_keep[mcols_to_keep %in% colnames(GenomicRanges::mcols(gr))]
   
   if (length(existing_cols) > 0 && ncol(GenomicRanges::mcols(gr)) > length(existing_cols)) {
@@ -1316,7 +1321,7 @@ export_orfs_bed <- function(orfs, txdb, file) {
   }
   
   # Get unified output (grouped GRangesList)
-  orfs <- .make_unified_output(gr)
+  orfs <- .make_unified_output(gr, NULL)
   
   list(orfs = orfs, metadata = metadata)
 }
@@ -1468,6 +1473,17 @@ export_orfs_bed <- function(orfs, txdb, file) {
       col <- .resolve_column(field, cmap, cols)
       if (!is.na(col) && !(field %in% colnames(GenomicRanges::mcols(gr)))) {
         GenomicRanges::mcols(gr)[[field]] <- GenomicRanges::mcols(gr)[[col]]
+      }
+    }
+
+    # User-requested additional columns (for GRanges/GRangesList path)
+    if (!is.null(additional_cols)) {
+      for (col in additional_cols) {
+        if (col %in% cols && !(col %in% colnames(GenomicRanges::mcols(gr)))) {
+          GenomicRanges::mcols(gr)[[col]] <- GenomicRanges::mcols(gr)[[col]]
+        } else if (!col %in% cols) {
+          warning("Column '", col, "' not found in ", spec$name, " output.")
+        }
       }
     }
 
