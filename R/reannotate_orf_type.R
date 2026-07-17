@@ -167,6 +167,40 @@ orf_type_levels <- function() {
   }, logical(1))
 }
 
+.pmap_to_transcript_compat <- function(
+    x, transcripts, x.is.sorted = TRUE, tx.is.sorted = FALSE) {
+  used_seqlevels <- unique(as.character(GenomicRanges::seqnames(x)))
+  missing_seqlevels <- setdiff(
+    used_seqlevels, GenomeInfoDb::seqlevels(transcripts)
+  )
+  if (length(missing_seqlevels)) {
+    stop(
+      "Mapped ranges use seqlevels absent from the reference transcripts: ",
+      paste(missing_seqlevels, collapse = ", "),
+      call. = FALSE
+    )
+  }
+
+  # Older ORFik versions compare all seqlevels rather than only those in use
+  # and fail when x carries harmless unused levels. Prune x to its used levels
+  # before mapping so both old and current ORFik releases behave consistently.
+  x <- GenomeInfoDb::keepSeqlevels(
+    x, used_seqlevels, pruning.mode = "coarse"
+  )
+
+  args <- list(
+    x = x,
+    transcripts = transcripts,
+    x.is.sorted = x.is.sorted,
+    tx.is.sorted = tx.is.sorted
+  )
+  if ("set.seqlengths" %in%
+      names(formals(ORFik::pmapToTranscriptF))) {
+    args$set.seqlengths <- FALSE
+  }
+  do.call(ORFik::pmapToTranscriptF, args)
+}
+
 #' Re-annotate ORF type from transcript and CDS geometry
 #'
 #' Classify genomic ORFs relative to every compatible reference transcript and
@@ -305,13 +339,11 @@ reannotate_orf_type <- function(
     orf_3p_g <- ORFik::stopSites(
       pair_orfs_grl, asGR = TRUE, keep.names = FALSE, is.sorted = FALSE
     )
-    orf_5p_mapped <- ORFik::pmapToTranscriptF(
-      orf_5p_g, pair_tx, x.is.sorted = TRUE, tx.is.sorted = FALSE,
-      set.seqlengths = FALSE
+    orf_5p_mapped <- .pmap_to_transcript_compat(
+      orf_5p_g, pair_tx, x.is.sorted = TRUE, tx.is.sorted = FALSE
     )
-    orf_3p_mapped <- ORFik::pmapToTranscriptF(
-      orf_3p_g, pair_tx, x.is.sorted = TRUE, tx.is.sorted = FALSE,
-      set.seqlengths = FALSE
+    orf_3p_mapped <- .pmap_to_transcript_compat(
+      orf_3p_g, pair_tx, x.is.sorted = TRUE, tx.is.sorted = FALSE
     )
 
     orf_5p_tx <- as.integer(GenomicRanges::start(orf_5p_mapped))
@@ -351,15 +383,13 @@ reannotate_orf_type <- function(
       cds_3p_g <- ORFik::stopSites(
         pair_cds, asGR = TRUE, keep.names = FALSE, is.sorted = FALSE
       )
-      cds_5p_mapped <- ORFik::pmapToTranscriptF(
+      cds_5p_mapped <- .pmap_to_transcript_compat(
         cds_5p_g, pair_tx[coding_i],
-        x.is.sorted = TRUE, tx.is.sorted = FALSE,
-        set.seqlengths = FALSE
+        x.is.sorted = TRUE, tx.is.sorted = FALSE
       )
-      cds_3p_mapped <- ORFik::pmapToTranscriptF(
+      cds_3p_mapped <- .pmap_to_transcript_compat(
         cds_3p_g, pair_tx[coding_i],
-        x.is.sorted = TRUE, tx.is.sorted = FALSE,
-        set.seqlengths = FALSE
+        x.is.sorted = TRUE, tx.is.sorted = FALSE
       )
       cds_5p_tx[coding_i] <-
         as.integer(GenomicRanges::start(cds_5p_mapped))

@@ -255,6 +255,23 @@ test_that("ORF IDs can be supplied in a metadata column", {
   expect_equal(result$orfs$orf_id, "stable_id")
 })
 
+test_that("unused ORF seqlevels do not break transcript mapping", {
+  ref <- make_type_reference()
+  orf <- GenomicRanges::GRanges(
+    "chr1", IRanges::IRanges(200, 399), strand = "+"
+  )
+  GenomeInfoDb::seqlevels(orf) <- c("chr1", "unused_contig")
+  names(orf) <- "extra_seqlevel"
+
+  result <- reannotate_orf_type(orf, ref$transcripts, ref$cds)
+
+  expect_equal(
+    as.character(result$orfs$reference_orf_type),
+    "annotated CDS"
+  )
+  expect_equal(result$orfs$matched_transcript_id, "tx_coding")
+})
+
 test_that("input and priority validation fail clearly", {
   ref <- make_type_reference()
   unstranded <- GenomicRanges::GRanges(
