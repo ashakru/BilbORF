@@ -13,9 +13,10 @@ reannotate_orf_type(
 )
 }
 \arguments{
-\item{orfs}{A \code{GRanges} with one genomic bounding range per ORF. Each range
-must have an explicit \code{+} or \code{-} strand. Coordinates must use the same
-inclusive boundary convention as \code{cds_by_tx}.}
+\item{orfs}{A \code{GRanges} with one genomic bounding range per ORF, or a
+\code{GRangesList} with one exon-resolved range chain per ORF. Each ORF must use
+one seqname and an explicit \code{+} or \code{-} strand. Coordinates must use the
+same inclusive boundary convention as \code{cds_by_tx}.}
 
 \item{transcripts}{A \code{GRangesList} of transcript exons with unique transcript
 IDs in \code{names(transcripts)}.}
@@ -48,8 +49,13 @@ coordinates with ORFik, so exon junctions and negative-strand transcripts
 are handled in transcript orientation.
 }
 \details{
-A transcript is compatible when both ORF boundaries map to its exons. The
-following mutually exclusive rules are evaluated in transcript coordinates:
+A transcript is compatible when both ORF boundaries map to its exons. For
+\code{GRangesList} input, the complete ORF exon chain must additionally equal the
+transcript's exonic coverage between those boundaries. Thus transcripts with
+incompatible internal splice junctions are excluded. A single-range
+\code{GRanges} does not contain enough information for this splice-chain check and
+retains boundary-only compatibility. The following mutually exclusive rules
+are evaluated in transcript coordinates:
 \itemize{
 \item exact CDS boundaries: \verb{annotated CDS};
 \item same CDS 3' boundary and an in-frame upstream/downstream 5' boundary:

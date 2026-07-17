@@ -128,6 +128,102 @@ test_that("spliced transcript coordinates ignore intron widths", {
   expect_equal(as.character(result$orfs$reference_orf_type), "annotated CDS")
   expect_equal(result$pairs$orf_5p_tx, result$pairs$cds_5p_tx)
   expect_equal(result$pairs$orf_3p_tx, result$pairs$cds_3p_tx)
+  expect_false(result$orfs$splice_chain_supplied)
+  expect_false(result$pairs$splice_chain_checked)
+  expect_true(result$pairs$splice_chain_compatible)
+})
+
+test_that("exon-resolved ORFs require a compatible splice chain", {
+  transcripts <- GenomicRanges::GRangesList(
+    tx_spliced = GenomicRanges::GRanges(
+      "chr1",
+      IRanges::IRanges(start = c(100, 300), end = c(199, 399)),
+      strand = "+"
+    )
+  )
+  cds <- GenomicRanges::GRangesList(
+    tx_spliced = GenomicRanges::GRanges(
+      "chr1",
+      IRanges::IRanges(start = c(150, 300), end = c(199, 350)),
+      strand = "+"
+    )
+  )
+  orfs <- GenomicRanges::GRangesList(
+    `ORF_100000:c1` = GenomicRanges::GRanges(
+      "chr1",
+      IRanges::IRanges(start = c(150, 300), end = c(199, 350)),
+      strand = "+",
+      exon_rank = 1:2
+    ),
+    `ORF_100000:c2` = GenomicRanges::GRanges(
+      "chr1",
+      IRanges::IRanges(start = c(150, 300), end = c(189, 350)),
+      strand = "+",
+      exon_rank = 1:2
+    )
+  )
+
+  result <- reannotate_orf_type(orfs, transcripts, cds)
+
+  expect_equal(
+    result$orfs$orf_id,
+    c("ORF_100000:c1", "ORF_100000:c2")
+  )
+  expect_equal(result$orfs$n_orf_exons, c(2L, 2L))
+  expect_true(all(result$orfs$splice_chain_supplied))
+  expect_equal(
+    as.character(result$orfs$reference_orf_type),
+    c("annotated CDS", "varRNA-ORF")
+  )
+  expect_equal(result$orfs$n_compatible_transcripts, c(1L, 0L))
+
+  compatible <- result$pairs[result$pairs$orf_id == "ORF_100000:c1", ]
+  incompatible <- result$pairs[result$pairs$orf_id == "ORF_100000:c2", ]
+  expect_true(compatible$splice_chain_checked)
+  expect_true(compatible$splice_chain_compatible)
+  expect_true(incompatible$splice_chain_checked)
+  expect_false(incompatible$splice_chain_compatible)
+  expect_match(incompatible$annotation_status, "splice chain")
+  expect_match(
+    result$orfs$reference_annotation_status[2],
+    "no transcript has a compatible ORF splice chain"
+  )
+})
+
+test_that("exon-resolved minus-strand ORFs retain transcript orientation", {
+  transcripts <- GenomicRanges::GRangesList(
+    tx_minus = GenomicRanges::GRanges(
+      "chr1",
+      IRanges::IRanges(start = c(100, 300), end = c(199, 399)),
+      strand = "-"
+    )
+  )
+  cds <- GenomicRanges::GRangesList(
+    tx_minus = GenomicRanges::GRanges(
+      "chr1",
+      IRanges::IRanges(start = c(150, 300), end = c(199, 350)),
+      strand = "-"
+    )
+  )
+  orfs <- GenomicRanges::GRangesList(
+    minus_exact = GenomicRanges::GRanges(
+      "chr1",
+      IRanges::IRanges(start = c(150, 300), end = c(199, 350)),
+      strand = "-",
+      exon_rank = 2:1
+    )
+  )
+
+  result <- reannotate_orf_type(orfs, transcripts, cds)
+
+  expect_equal(
+    as.character(result$orfs$reference_orf_type),
+    "annotated CDS"
+  )
+  expect_true(result$pairs$splice_chain_checked)
+  expect_true(result$pairs$splice_chain_compatible)
+  expect_equal(result$pairs$orf_5p_tx, result$pairs$cds_5p_tx)
+  expect_equal(result$pairs$orf_3p_tx, result$pairs$cds_3p_tx)
 })
 
 test_that("an ORF without a compatible transcript receives the fallback", {
@@ -177,5 +273,17 @@ test_that("input and priority validation fail clearly", {
       type_priority = c("annotated CDS", "varRNA-ORF")
     ),
     "every supported ORF type"
+  )
+
+  mixed_seqnames <- GenomicRanges::GRangesList(
+    bad_orf = GenomicRanges::GRanges(
+      c("chr1", "chr2"),
+      IRanges::IRanges(c(200, 300), c(250, 350)),
+      strand = "+"
+    )
+  )
+  expect_error(
+    reannotate_orf_type(mixed_seqnames, ref$transcripts, ref$cds),
+    "one seqname and one strand"
   )
 })

@@ -78,6 +78,95 @@ orf_type_levels <- function() {
   invisible(x)
 }
 
+.prepare_orf_geometry <- function(orfs) {
+  is_gr <- methods::is(orfs, "GRanges")
+  is_grl <- methods::is(orfs, "GRangesList")
+  if (!is_gr && !is_grl) {
+    stop("orfs must be a GRanges or GRangesList", call. = FALSE)
+  }
+
+  if (is_gr) {
+    chains <- ORFik::groupGRangesBy(orfs, seq_along(orfs))
+    spans <- orfs
+    splice_chain_supplied <- FALSE
+  } else {
+    if (any(S4Vectors::elementNROWS(orfs) == 0L)) {
+      stop("Every ORF in a GRangesList must contain at least one range",
+           call. = FALSE)
+    }
+    span_list <- range(orfs, ignore.strand = FALSE)
+    if (any(S4Vectors::elementNROWS(span_list) != 1L)) {
+      stop(
+        "Every GRangesList ORF must use exactly one seqname and one strand",
+        call. = FALSE
+      )
+    }
+    chains <- orfs
+    spans <- unlist(span_list, use.names = FALSE)
+    splice_chain_supplied <- TRUE
+  }
+
+  flat_orfs <- unlist(chains, use.names = FALSE)
+  if (any(!as.character(GenomicRanges::strand(flat_orfs)) %in% c("+", "-"))) {
+    stop("Every ORF must have an explicit '+' or '-' strand", call. = FALSE)
+  }
+
+  list(
+    chains = chains,
+    spans = spans,
+    n_exons = as.integer(S4Vectors::elementNROWS(chains)),
+    splice_chain_supplied = splice_chain_supplied
+  )
+}
+
+.splice_chain_matches_transcript <- function(orf_chains, transcripts) {
+  if (length(orf_chains) != length(transcripts)) {
+    stop("Internal error: ORF and transcript pair counts differ", call. = FALSE)
+  }
+
+  orf_starts <- GenomicRanges::start(orf_chains)
+  orf_ends <- GenomicRanges::end(orf_chains)
+  tx_starts <- GenomicRanges::start(transcripts)
+  tx_ends <- GenomicRanges::end(transcripts)
+
+  internal_gaps <- function(starts, ends) {
+    ord <- order(starts, ends)
+    starts <- starts[ord]
+    ends <- ends[ord]
+    if (length(starts) < 2L) {
+      return(list(start = integer(), end = integer(), valid = TRUE))
+    }
+
+    gap_start <- ends[-length(ends)] + 1L
+    gap_end <- starts[-1L] - 1L
+    list(
+      start = gap_start,
+      end = gap_end,
+      valid = all(gap_start <= gap_end)
+    )
+  }
+
+  vapply(seq_along(orf_chains), function(i) {
+    os <- as.integer(orf_starts[[i]])
+    oe <- as.integer(orf_ends[[i]])
+    ts <- as.integer(tx_starts[[i]])
+    te <- as.integer(tx_ends[[i]])
+    orf_gaps <- internal_gaps(os, oe)
+    if (!orf_gaps$valid) {
+      return(FALSE)
+    }
+
+    tx_gaps <- internal_gaps(ts, te)
+    span_start <- min(os)
+    span_end <- max(oe)
+    inside_orf <-
+      tx_gaps$start >= span_start & tx_gaps$end <= span_end
+
+    identical(orf_gaps$start, tx_gaps$start[inside_orf]) &&
+      identical(orf_gaps$end, tx_gaps$end[inside_orf])
+  }, logical(1))
+}
+
 #' Re-annotate ORF type from transcript and CDS geometry
 #'
 #' Classify genomic ORFs relative to every compatible reference transcript and
@@ -85,9 +174,10 @@ orf_type_levels <- function() {
 #' coordinates with ORFik, so exon junctions and negative-strand transcripts
 #' are handled in transcript orientation.
 #'
-#' @param orfs A `GRanges` with one genomic bounding range per ORF. Each range
-#'   must have an explicit `+` or `-` strand. Coordinates must use the same
-#'   inclusive boundary convention as `cds_by_tx`.
+#' @param orfs A `GRanges` with one genomic bounding range per ORF, or a
+#'   `GRangesList` with one exon-resolved range chain per ORF. Each ORF must use
+#'   one seqname and an explicit `+` or `-` strand. Coordinates must use the
+#'   same inclusive boundary convention as `cds_by_tx`.
 #' @param transcripts A `GRangesList` of transcript exons with unique transcript
 #'   IDs in `names(transcripts)`.
 #' @param cds_by_tx A `GRangesList` of CDS exons named in the same transcript-ID
@@ -109,8 +199,13 @@ orf_type_levels <- function() {
 #' }
 #'
 #' @details
-#' A transcript is compatible when both ORF boundaries map to its exons. The
-#' following mutually exclusive rules are evaluated in transcript coordinates:
+#' A transcript is compatible when both ORF boundaries map to its exons. For
+#' `GRangesList` input, the complete ORF exon chain must additionally equal the
+#' transcript's exonic coverage between those boundaries. Thus transcripts with
+#' incompatible internal splice junctions are excluded. A single-range
+#' `GRanges` does not contain enough information for this splice-chain check and
+#' retains boundary-only compatibility. The following mutually exclusive rules
+#' are evaluated in transcript coordinates:
 #'
 #' * exact CDS boundaries: `annotated CDS`;
 #' * same CDS 3' boundary and an in-frame upstream/downstream 5' boundary:
@@ -151,9 +246,9 @@ reannotate_orf_type <- function(
     id_col = NULL,
     type_priority = .BILBORF_REFERENCE_ORF_TYPE_PRIORITY) {
 
-  if (!methods::is(orfs, "GRanges")) {
-    stop("orfs must be a GRanges", call. = FALSE)
-  }
+  orf_geometry <- .prepare_orf_geometry(orfs)
+  orf_chains <- orf_geometry$chains
+  orf_spans <- orf_geometry$spans
   .validate_named_grl(transcripts, "transcripts")
   .validate_named_grl(cds_by_tx, "cds_by_tx")
 
@@ -163,10 +258,6 @@ reannotate_orf_type <- function(
     stop("type_priority must contain every supported ORF type exactly once",
          call. = FALSE)
   }
-  if (any(!as.character(GenomicRanges::strand(orfs)) %in% c("+", "-"))) {
-    stop("Every ORF must have an explicit '+' or '-' strand", call. = FALSE)
-  }
-
   orf_ids <- if (!is.null(id_col)) {
     if (!id_col %in% colnames(GenomicRanges::mcols(orfs))) {
       stop("id_col is not present in mcols(orfs): ", id_col, call. = FALSE)
@@ -186,7 +277,7 @@ reannotate_orf_type <- function(
   names(tx_spans) <- tx_ids
 
   hits <- GenomicRanges::findOverlaps(
-    orfs, tx_spans, ignore.strand = FALSE
+    orf_spans, tx_spans, ignore.strand = FALSE
   )
   qh <- S4Vectors::queryHits(hits)
   sh <- S4Vectors::subjectHits(hits)
@@ -194,6 +285,7 @@ reannotate_orf_type <- function(
   pair_template <- tibble::tibble(
     orf_id = character(), transcript_id = character(),
     coding_transcript = logical(), boundaries_exonic = logical(),
+    splice_chain_checked = logical(), splice_chain_compatible = logical(),
     orf_5p_tx = integer(), orf_3p_tx = integer(),
     cds_5p_tx = integer(), cds_3p_tx = integer(),
     start_in_cds_frame = logical(), end_in_cds_frame = logical(),
@@ -203,21 +295,15 @@ reannotate_orf_type <- function(
   if (!length(qh)) {
     pair_table <- pair_template
   } else {
-    pair_orfs <- orfs[qh]
+    pair_orfs_grl <- orf_chains[qh]
     pair_tx <- transcripts[sh]
     pair_tx_ids <- tx_ids[sh]
 
-    # ORFik 1.29.x requires grouped ranges for startSites()/stopSites().
-    # Each candidate pair is deliberately its own one-range group.
-    pair_orfs_grl <- ORFik::groupGRangesBy(
-      pair_orfs, seq_along(pair_orfs)
-    )
-
     orf_5p_g <- ORFik::startSites(
-      pair_orfs_grl, asGR = TRUE, keep.names = FALSE, is.sorted = TRUE
+      pair_orfs_grl, asGR = TRUE, keep.names = FALSE, is.sorted = FALSE
     )
     orf_3p_g <- ORFik::stopSites(
-      pair_orfs_grl, asGR = TRUE, keep.names = FALSE, is.sorted = TRUE
+      pair_orfs_grl, asGR = TRUE, keep.names = FALSE, is.sorted = FALSE
     )
     orf_5p_mapped <- ORFik::pmapToTranscriptF(
       orf_5p_g, pair_tx, x.is.sorted = TRUE, tx.is.sorted = FALSE,
@@ -235,6 +321,16 @@ reannotate_orf_type <- function(
       as.character(GenomicRanges::strand(orf_5p_mapped)) != "*" &
       as.character(GenomicRanges::strand(orf_3p_mapped)) != "*" &
       orf_5p_tx <= orf_3p_tx
+
+    splice_chain_checked <- rep(
+      orf_geometry$splice_chain_supplied, length(qh)
+    )
+    splice_chain_compatible <- rep(TRUE, length(qh))
+    if (orf_geometry$splice_chain_supplied) {
+      splice_chain_compatible <- .splice_chain_matches_transcript(
+        pair_orfs_grl, pair_tx
+      )
+    }
 
     coding_transcript <- pair_tx_ids %in% names(cds_by_tx)
     coding_i <- which(coding_transcript)
@@ -274,7 +370,8 @@ reannotate_orf_type <- function(
     cds_projected <-
       !is.na(cds_5p_tx) & !is.na(cds_3p_tx) &
       cds_5p_tx > 0L & cds_3p_tx > 0L & cds_5p_tx <= cds_3p_tx
-    classifiable <- boundaries_exonic & coding_transcript & cds_projected
+    compatible_geometry <- boundaries_exonic & splice_chain_compatible
+    classifiable <- compatible_geometry & coding_transcript & cds_projected
 
     start_in_cds_frame <- rep(NA, length(qh))
     end_in_cds_frame <- rep(NA, length(qh))
@@ -284,7 +381,7 @@ reannotate_orf_type <- function(
       (orf_3p_tx[classifiable] - cds_3p_tx[classifiable]) %% 3L == 0L
 
     reference_orf_type <- rep(NA_character_, length(qh))
-    reference_orf_type[boundaries_exonic & !coding_transcript] <-
+    reference_orf_type[compatible_geometry & !coding_transcript] <-
       "varRNA-ORF"
     reference_orf_type[classifiable] <- .classify_orf_cds_geometry(
       orf_5p_tx[classifiable], orf_3p_tx[classifiable],
@@ -293,6 +390,8 @@ reannotate_orf_type <- function(
 
     annotation_status <- dplyr::case_when(
       !boundaries_exonic ~ "ORF boundary not exonic on transcript",
+      !splice_chain_compatible ~
+        "ORF splice chain is incompatible with transcript",
       !coding_transcript ~ "compatible transcript has no annotated CDS",
       !cds_projected ~ "CDS could not be projected onto transcript",
       .default = "classified against annotated CDS"
@@ -303,6 +402,8 @@ reannotate_orf_type <- function(
       transcript_id = pair_tx_ids,
       coding_transcript = coding_transcript,
       boundaries_exonic = boundaries_exonic,
+      splice_chain_checked = splice_chain_checked,
+      splice_chain_compatible = splice_chain_compatible,
       orf_5p_tx = orf_5p_tx,
       orf_3p_tx = orf_3p_tx,
       cds_5p_tx = cds_5p_tx,
@@ -315,7 +416,10 @@ reannotate_orf_type <- function(
   }
 
   valid_pairs <- pair_table |>
-    dplyr::filter(boundaries_exonic, !is.na(reference_orf_type)) |>
+    dplyr::filter(
+      boundaries_exonic, splice_chain_compatible,
+      !is.na(reference_orf_type)
+    ) |>
     dplyr::mutate(.priority = match(reference_orf_type, type_priority))
 
   best_pair <- valid_pairs |>
@@ -329,6 +433,8 @@ reannotate_orf_type <- function(
       reference_orf_type = reference_orf_type,
       reference_start_in_frame = start_in_cds_frame,
       reference_end_in_frame = end_in_cds_frame,
+      reference_splice_chain_checked = splice_chain_checked,
+      reference_splice_chain_compatible = splice_chain_compatible,
       reference_annotation_status = annotation_status
     )
 
@@ -343,12 +449,30 @@ reannotate_orf_type <- function(
       .groups = "drop"
     )
 
+  fallback_status <- rep(
+    "no transcript carries both ORF boundaries; fallback",
+    length(orf_ids)
+  )
+  names(fallback_status) <- orf_ids
+  if (nrow(pair_table)) {
+    boundary_ids <- unique(pair_table$orf_id[pair_table$boundaries_exonic])
+    chain_ids <- unique(pair_table$orf_id[
+      pair_table$boundaries_exonic & pair_table$splice_chain_compatible
+    ])
+    fallback_status[boundary_ids] <-
+      "no transcript has a compatible ORF splice chain; fallback"
+    fallback_status[chain_ids] <-
+      "compatible transcript could not be classified; fallback"
+  }
+
   orf_table <- tibble::tibble(
     orf_id = orf_ids,
-    seqnames = as.character(GenomicRanges::seqnames(orfs)),
-    start = GenomicRanges::start(orfs),
-    end = GenomicRanges::end(orfs),
-    strand = as.character(GenomicRanges::strand(orfs))
+    seqnames = as.character(GenomicRanges::seqnames(orf_spans)),
+    start = GenomicRanges::start(orf_spans),
+    end = GenomicRanges::end(orf_spans),
+    strand = as.character(GenomicRanges::strand(orf_spans)),
+    n_orf_exons = orf_geometry$n_exons,
+    splice_chain_supplied = orf_geometry$splice_chain_supplied
   ) |>
     dplyr::left_join(best_pair, by = "orf_id") |>
     dplyr::left_join(pair_summary, by = "orf_id") |>
@@ -358,7 +482,7 @@ reannotate_orf_type <- function(
       ),
       reference_annotation_status = dplyr::coalesce(
         reference_annotation_status,
-        "no transcript carries both ORF boundaries; fallback"
+        unname(fallback_status[orf_id])
       ),
       n_compatible_transcripts = dplyr::coalesce(
         n_compatible_transcripts, 0L
