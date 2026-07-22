@@ -9,14 +9,19 @@ reannotate_orf_type(
   transcripts,
   cds_by_tx,
   id_col = NULL,
-  type_priority = .BILBORF_REFERENCE_ORF_TYPE_PRIORITY
+  type_priority = .BILBORF_REFERENCE_ORF_TYPE_PRIORITY,
+  stop_codon_convention = c("auto", "included", "excluded"),
+  allow_terminal_extrapolation = TRUE,
+  max_terminal_overhang = 30L,
+  unmatched_type = NA_character_
 )
 }
 \arguments{
 \item{orfs}{A \code{GRanges} with one genomic bounding range per ORF, or a
 \code{GRangesList} with one exon-resolved range chain per ORF. Each ORF must use
-one seqname and an explicit \code{+} or \code{-} strand. Coordinates must use the
-same inclusive boundary convention as \code{cds_by_tx}.}
+one seqname and an explicit \code{+} or \code{-} strand. Coordinates are 1-based and
+inclusive; use \code{stop_codon_convention} to describe whether the 3' endpoint
+includes the stop codon.}
 
 \item{transcripts}{A \code{GRangesList} of transcript exons with unique transcript
 IDs in \code{names(transcripts)}.}
@@ -31,6 +36,28 @@ generated only when names are absent.}
 \item{type_priority}{Character vector containing every value returned by
 \code{\link[=orf_type_levels]{orf_type_levels()}} exactly once. It determines which interpretation wins
 when an ORF has different types on different transcript isoforms.}
+
+\item{stop_codon_convention}{How the ORF 3' boundary represents the stop
+codon. \code{"included"} requires the ORF and CDS 3' endpoints to use the same
+inclusive coordinate. \code{"excluded"} adds 3 nt to every ORF 3' endpoint for
+classification. The default, \code{"auto"}, adds 3 nt only when an ORF endpoint
+is exactly 3 nt before the annotated CDS endpoint. This handles callers
+that report the last coding nucleotide while retaining exact matches from
+callers that include the stop codon. The applied adjustment is reported in
+both output tables. Use \code{"included"} for strict boundary comparison.}
+
+\item{allow_terminal_extrapolation}{Logical. When \code{TRUE}, a short ORF
+overhang beyond an annotated transcript end may be extrapolated to infer an
+in-frame N-, C-, or NC-terminal extension when no complete transcript
+interpretation exists.}
+
+\item{max_terminal_overhang}{Maximum number of nucleotides allowed beyond
+either annotated transcript end during terminal extrapolation.}
+
+\item{unmatched_type}{Value used when no complete or extrapolated reference
+interpretation is possible. The default \code{NA_character_} avoids conflating
+unsupported ORFs with \code{varRNA-ORF}. A non-missing value must be present in
+\code{\link[=orf_type_levels]{orf_type_levels()}}.}
 }
 \value{
 A list with two tibbles:
@@ -66,14 +93,22 @@ are evaluated in transcript coordinates:
 \item wholly upstream/downstream: \code{uORF}/\code{dORF};
 \item overlapping the CDS from upstream/downstream: \code{uoORF}/\code{doORF};
 \item contained within the CDS after the exact/truncation rules: \code{intORF};
-\item a compatible transcript without a CDS, or no compatible transcript:
-\code{varRNA-ORF}.
+\item a compatible transcript without a CDS: \code{varRNA-ORF}.
 }
 
+With \code{stop_codon_convention = "auto"}, a 3-nt-short ORF 3' boundary is
+interpreted as an omitted annotated stop codon. Because genomic coordinates
+alone cannot distinguish that convention from a genuine one-codon
+C-terminal truncation, use \code{"included"} when all ORF inputs are known to
+include their stop codons.
+
 Exact CDS and in-frame canonical variants take precedence over a
-non-canonical interpretation on another isoform by default. This function
-uses geometry only; it does not inspect genomic sequence for start codons,
-stop codons, or internal stops.
+non-canonical interpretation on another isoform by default. Complete
+transcript interpretations always take precedence over inferred terminal
+extrapolations. Extrapolation is limited to canonical terminal extensions,
+requires compatible splice geometry, and is reported explicitly in the
+output. This function uses geometry only; it does not inspect genomic
+sequence for start codons, stop codons, or internal stops.
 }
 \examples{
 library(GenomicRanges)

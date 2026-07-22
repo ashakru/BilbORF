@@ -4,7 +4,7 @@
 \alias{.make_unified_output}
 \title{Create unified output (GRanges with core metadata)}
 \usage{
-.make_unified_output(gr)
+.make_unified_output(gr, additional_cols = NULL)
 }
 \description{
 Create unified output (GRanges with core metadata)

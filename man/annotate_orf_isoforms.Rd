@@ -11,7 +11,11 @@ annotate_orf_isoforms(
   transcript_meta,
   orfs_meta = NULL,
   start_codons = c("ATG", "TTG", "CTG", "GTG"),
-  stop_codons = c("TAG", "TAA", "TGA")
+  stop_codons = c("TAG", "TAA", "TGA"),
+  stop_codon_convention = c("auto", "included", "excluded"),
+  check_stop_codon = FALSE,
+  cds_gr = NULL,
+  chunk_size = NULL
 )
 }
 \arguments{
@@ -40,31 +44,82 @@ to the output.}
 
 \item{stop_codons}{Character vector of valid stop codons. Default is
 \code{c("TAG", "TAA", "TGA")} covering all standard stop codons.}
+
+\item{stop_codon_convention}{How the input 3' boundary represents the stop
+codon. \code{"included"} validates the terminal triplet, \code{"excluded"} validates
+and adds the following three transcript-oriented nucleotides, and
+\code{"auto"} accepts a convention only when exactly one candidate is a valid
+stop. The clean parsed-caller cache should use \code{"excluded"} explicitly.}
+
+\item{check_stop_codon}{Deprecated compatibility argument. The 3 nt
+immediately 3' of each input ORF are now always checked because they are
+required to resolve and validate the stop-codon convention. Splice
+junctions are handled correctly: if the ORF ends in one exon the search
+continues into the next exon. The output includes:
+\code{downstream_codon} (the 3 nt, or \code{NA} if the transcript ends
+within 3 nt), \code{downstream_is_stop} (logical), and
+\code{stop_codon_end} (strand-aware genomic position of the last nt of
+the downstream triplet: \code{max(end)} for + strand, \code{min(start)}
+for - strand). The argument currently has no effect. Default \code{FALSE}.}
+
+\item{cds_gr}{Optional \code{GRangesList} of annotated CDS exons, keyed by
+\code{transcript_id} (the same key space as
+\code{names(annotations\$transcripts)}). Typically obtained via
+\code{cdsBy(txdb, by = "tx", use.names = TRUE)} or by subsetting a
+pre-built list to the relevant transcripts. When supplied, each ORF-
+transcript pair is tested for exon-level overlap with the CDS of that
+specific transcript, and the reading frame is determined in transcript
+coordinates (so splice junctions between the ORF and the CDS are handled
+correctly). Frame is \code{(tx_coord_orf_5prime - tx_coord_cds_5prime)
+  \%\% 3 == 0}. Adds \code{overlaps_cds} (logical, \code{FALSE} if no
+overlap, \code{NA} for intronic / no-transcript rows) and
+\code{cds_frame} (\code{"in_frame"} / \code{"out_of_frame"} /
+\code{NA}). It also classifies every successfully normalised ORF-isoform
+pair into \code{reference_orf_type} and \code{reference_orf_class} using
+the already-computed transcript coordinates; no second ORF/transcript
+intersection is performed. Default \code{NULL}.}
+
+\item{chunk_size}{Integer. When set, ORFs are split into batches of this
+size and processed sequentially, with \code{gc()} called between batches
+to release memory. This keeps peak memory proportional to
+\code{chunk_size} rather than the full dataset. \code{unique_aa_id} is
+recomputed globally after all chunks are combined. A value of 500-2000 is
+usually appropriate. Note: true parallelism is not supported because
+\code{BSgenome} objects contain C-level pointers that do not serialise
+safely across worker processes. Default \code{NULL} (no chunking).}
 }
 \value{
 A list with two elements:
 \describe{
 \item{table}{A data.frame (tibble) with one row per ORF-transcript pair.
-Key columns include:
+Every input ORF appears at least once. Key columns include:
 \itemize{
 \item \code{ORF_isoform_id}: Unique identifier for ORF-transcript pair
 \item \code{ORF_id}: Original ORF identifier
-\item \code{transcript_id}: Overlapping transcript ID
+\item \code{transcript_id}: Overlapping transcript ID (NA for
+\code{orf_status = "no_transcript"})
 \item \code{gene_id}, \code{gene_name}: Gene annotations
 \item \code{seq_nt}: Nucleotide sequence of the ORF in this isoform
+(NA for \code{"intronic"} and \code{"no_transcript"})
 \item \code{seq_aa}: Translated amino acid sequence
+\item \code{len_nt}, \code{len_aa}: Sequence lengths
 \item \code{start_codon}, \code{stop_codon}: First and last codons
 \item \code{orf_status}: Translation status (see Details)
-\item \code{unique_tx_iso}: Groups isoforms producing identical proteins
+\item \code{complete_codons}: FALSE if sequence length is not
+divisible by 3; NA for rows without sequence
+\item \code{unique_tx_iso}: Groups isoforms producing identical
+proteins (NA for non-translatable statuses)
 }}
-\item{ranges}{A GRangesList with genomic coordinates of ORF-transcript
-intersections, representing the actual translated regions.}
+\item{ranges}{A stop-inclusive \code{GRangesList} of successfully projected
+ORF-transcript pairs. Names match \code{ORF_isoform_id} in \code{table}. The table
+reports both stop-exclusive and stop-inclusive genomic bounds.}
 }
 }
 \description{
 Maps Open Reading Frames (ORFs) to overlapping transcript isoforms and
 determines their translation competency by analyzing start codons, stop codons,
 and internal stops. Each ORF-transcript pair is evaluated independently.
+Every input ORF appears in the output at least once.
 }
 \details{
 \strong{ORF Status Categories:}
@@ -78,21 +133,34 @@ transcript terminus without proper termination.}
 \item{no_start}{Missing a valid start codon at the 5' end but has a stop.
 Cannot initiate translation properly.}
 \item{no_stop_no_start}{Missing both valid start and stop codons.}
+\item{intronic}{The ORF overlaps a transcript's genomic span but all its
+exons fall within introns of that transcript. Sequence columns are NA.}
+\item{no_transcript}{The ORF does not overlap any annotated transcript.
+Transcript and sequence columns are NA.}
 }
+
+Out-of-frame ORF-isoform pairs (where sequence length is not divisible by 3)
+are flagged via \code{complete_codons = FALSE} and a warning is emitted, but
+they are still classified with the standard status categories.
 
 \strong{Algorithm Overview:}
 \enumerate{
-\item Find overlaps between ORFs and transcripts
-\item Calculate spliced intersections (ORF coordinates within each transcript)
-\item Extract and translate sequences
+\item Find overlaps between ORFs and transcripts (GRangesList level);
+ORFs with no overlap are recorded as \code{"no_transcript"}
+\item Vectorised exon-level intersection: unlist both GRLs, single
+\code{findOverlaps} + \code{pintersect} + \code{splitAsList};
+entirely intronic pairs are recorded as \code{"intronic"}
+\item Extract and translate sequences for the remaining pairs
 \item Classify translation status
 \item Group isoforms producing identical proteins
+\item Append stub rows for intronic and no-transcript ORFs
 }
 }
 \note{
-ORF coordinates should represent the complete ORF boundaries (start to
-stop codon), not just the coding sequence. For multi-exon ORFs, provide
-all exonic segments.
+Set \code{stop_codon_convention} to match whether the input coordinates
+contain the terminal stop codon. Irrespective of the input convention,
+\code{ranges} and the primary \code{start}/\code{end}/sequence columns are
+stop-inclusive. For multi-exon ORFs, provide all exonic segments.
 }
 \examples{
 \dontrun{
@@ -116,8 +184,8 @@ transcripts_meta <- import(gtf, format = "GTF") \%>\%
 
 # Annotate ORFs
 result <- annotate_orf_isoforms(
-  annotations, 
-  orfs, 
+  annotations,
+  orfs,
   BSgenome.Hsapiens.UCSC.hg38,
   transcripts_meta
 )
@@ -128,29 +196,29 @@ head(result$table)
 }
 
 # Using package example data
-gtf <- system.file("extdata", "gencode.v35.annotation_chr10.gtf", 
+gtf <- system.file("extdata", "gencode.v35.annotation_chr10.gtf",
                    package = "BilbORF")
 bed <- system.file("extdata", "Ribo-seq_ORFs.bed", package = "BilbORF")
 
 if (gtf != "" && bed != "") {
   library(BSgenome.Hsapiens.UCSC.hg38)
   library(rtracklayer)
-  
+
   BSgenome <- BSgenome.Hsapiens.UCSC.hg38
   annotations <- prepare_annotations_fromGTF(gtf, BSgenome)
   orfs <- import(bed, format = "BED")
   names(orfs) <- orfs$name
-  
+
   transcripts_meta <- import(gtf, format = "GTF") \%>\%
     as.data.frame() \%>\%
     dplyr::filter(type == "transcript") \%>\%
     dplyr::select(gene_name, gene_id, transcript_id, transcript_type) \%>\%
     dplyr::distinct()
-  
+
   annotated_orfs <- annotate_orf_isoforms(
     annotations, orfs[1:5], BSgenome, transcripts_meta
   )
-  
+
   print(table(annotated_orfs$table$orf_status))
 }
 

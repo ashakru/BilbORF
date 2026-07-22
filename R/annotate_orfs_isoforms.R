@@ -24,15 +24,21 @@
 #'   \code{c("ATG","TTG","CTG","GTG")} covering canonical and alternative starts.
 #' @param stop_codons Character vector of valid stop codons. Default is
 #'   \code{c("TAG", "TAA", "TGA")} covering all standard stop codons.
-#' @param check_stop_codon Logical. If \code{TRUE}, checks whether the 3 nt
-#'   immediately 3' of each ORF on its mapped transcript form a stop codon.
-#'   Splice junctions are handled correctly: if the ORF ends in one exon the
-#'   search continues into the next exon. Adds three columns:
+#' @param stop_codon_convention How the input 3' boundary represents the stop
+#'   codon. `"included"` validates the terminal triplet, `"excluded"` validates
+#'   and adds the following three transcript-oriented nucleotides, and
+#'   `"auto"` accepts a convention only when exactly one candidate is a valid
+#'   stop. The clean parsed-caller cache should use `"excluded"` explicitly.
+#' @param check_stop_codon Deprecated compatibility argument. The 3 nt
+#'   immediately 3' of each input ORF are now always checked because they are
+#'   required to resolve and validate the stop-codon convention. Splice
+#'   junctions are handled correctly: if the ORF ends in one exon the search
+#'   continues into the next exon. The output includes:
 #'   \code{downstream_codon} (the 3 nt, or \code{NA} if the transcript ends
 #'   within 3 nt), \code{downstream_is_stop} (logical), and
 #'   \code{stop_codon_end} (strand-aware genomic position of the last nt of
-#'   the stop codon: \code{max(end)} for + strand, \code{min(start)} for -
-#'   strand). Default \code{FALSE}.
+#'   the downstream triplet: \code{max(end)} for + strand, \code{min(start)}
+#'   for - strand). The argument currently has no effect. Default \code{FALSE}.
 #' @param cds_gr Optional \code{GRangesList} of annotated CDS exons, keyed by
 #'   \code{transcript_id} (the same key space as
 #'   \code{names(annotations\$transcripts)}). Typically obtained via
@@ -45,7 +51,10 @@
 #'   \%\% 3 == 0}. Adds \code{overlaps_cds} (logical, \code{FALSE} if no
 #'   overlap, \code{NA} for intronic / no-transcript rows) and
 #'   \code{cds_frame} (\code{"in_frame"} / \code{"out_of_frame"} /
-#'   \code{NA}). Default \code{NULL}.
+#'   \code{NA}). It also classifies every successfully normalised ORF-isoform
+#'   pair into \code{reference_orf_type} and \code{reference_orf_class} using
+#'   the already-computed transcript coordinates; no second ORF/transcript
+#'   intersection is performed. Default \code{NULL}.
 #' @param chunk_size Integer. When set, ORFs are split into batches of this
 #'   size and processed sequentially, with \code{gc()} called between batches
 #'   to release memory. This keeps peak memory proportional to
@@ -76,10 +85,9 @@
 #'         \item \code{unique_tx_iso}: Groups isoforms producing identical
 #'           proteins (NA for non-translatable statuses)
 #'       }}
-#'     \item{ranges}{A GRangesList with genomic coordinates of ORF-transcript
-#'       exonic intersections. Contains entries only for rows with actual
-#'       sequence (\code{orf_status} is not \code{"intronic"} or
-#'       \code{"no_transcript"}).}
+#'     \item{ranges}{A stop-inclusive `GRangesList` of successfully projected
+#'       ORF-transcript pairs. Names match `ORF_isoform_id` in `table`. The table
+#'       reports both stop-exclusive and stop-inclusive genomic bounds.}
 #'   }
 #'
 #' @details
@@ -117,9 +125,10 @@
 #'   \item Append stub rows for intronic and no-transcript ORFs
 #' }
 #'
-#' @note ORF coordinates should represent the complete ORF boundaries (start to
-#'   stop codon), not just the coding sequence. For multi-exon ORFs, provide
-#'   all exonic segments.
+#' @note Set \code{stop_codon_convention} to match whether the input coordinates
+#'   contain the terminal stop codon. Irrespective of the input convention,
+#'   \code{ranges} and the primary \code{start}/\code{end}/sequence columns are
+#'   stop-inclusive. For multi-exon ORFs, provide all exonic segments.
 #'
 #' @importFrom ORFik groupGRangesBy
 #' @import tibble
@@ -195,9 +204,14 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
                                   transcript_meta, orfs_meta = NULL,
                                   start_codons     = c("ATG","TTG","CTG","GTG"),
                                   stop_codons      = c("TAG", "TAA", "TGA"),
+                                  stop_codon_convention = c(
+                                    "auto", "included", "excluded"
+                                  ),
                                   check_stop_codon = FALSE,
                                   cds_gr           = NULL,
                                   chunk_size       = NULL) {
+
+  stop_codon_convention <- match.arg(stop_codon_convention)
 
   # --- Chunked processing ---
   # When chunk_size is set and there are more ORFs than chunk_size, split the
@@ -223,6 +237,7 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
           orfs_meta        = orfs_meta,
           start_codons     = start_codons,
           stop_codons      = stop_codons,
+          stop_codon_convention = stop_codon_convention,
           check_stop_codon = check_stop_codon,
           cds_gr           = cds_gr,
           chunk_size       = NULL    # prevent recursive chunking
@@ -329,7 +344,7 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
 
   # --- Extract and translate sequences ---
   seq_nt     <- extractTranscriptSeqs(BSgenome, orf_in_tx)
-  seq_aa     <- suppressWarnings(translate(seq_nt))
+  seq_aa     <- suppressWarnings(Biostrings::translate(seq_nt))
   seq_nt_chr <- as.character(seq_nt)
   seq_aa_chr <- as.character(seq_aa)
 
@@ -347,12 +362,12 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
     ul_s[first_idx]
   })
 
-  # --- Optional: downstream stop codon check ---
+  # --- Transcript-coordinate stop candidates ---
   downstream_codon_vec   <- rep(NA_character_, length(orf_in_tx))
   downstream_is_stop_vec <- rep(NA,             length(orf_in_tx))
   stop_codon_end_vec     <- rep(NA_integer_,    length(orf_in_tx))
 
-  if (check_stop_codon) {
+  {
     # --- Vectorised downstream stop codon check ---
     # Key insight: extract full transcript sequence once per unique transcript,
     # then downstream codon = substr(tx_seq, orf_end_in_tx + 1, orf_end_in_tx + 3).
@@ -436,6 +451,153 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
     }
   }
 
+  # --- Resolve convention and construct stop-inclusive output chains ---
+  # `orf_5p_tx_all` and the transcript sequences above are reused; no second
+  # ORF/transcript exon intersection is performed.
+  input_seq_nt_chr <- seq_nt_chr
+  input_len_nt <- nchar(input_seq_nt_chr)
+  terminal_codon_vec <- ifelse(
+    input_len_nt >= 3L,
+    substr(input_seq_nt_chr, input_len_nt - 2L, input_len_nt),
+    NA_character_
+  )
+  terminal_is_stop_vec <- terminal_codon_vec %in% stop_codons
+
+  resolved_stop_convention <- rep(NA_character_, length(orf_in_tx))
+  stop_adjustment_nt <- rep(NA_integer_, length(orf_in_tx))
+  stop_normalization_status <- rep(
+    "stop convention unresolved", length(orf_in_tx)
+  )
+
+  if (stop_codon_convention == "included") {
+    resolved_stop_convention[] <- "included"
+    stop_adjustment_nt[] <- 0L
+    stop_normalization_status[] <- "input coordinates include stop codon"
+  } else if (stop_codon_convention == "excluded") {
+    resolved_stop_convention[] <- "excluded"
+    stop_adjustment_nt[] <- 3L
+    stop_normalization_status[] <-
+      "input coordinates exclude stop codon; added 3 transcript nt"
+  } else {
+    included_only <- terminal_is_stop_vec & !(downstream_is_stop_vec %in% TRUE)
+    excluded_only <- downstream_is_stop_vec %in% TRUE & !terminal_is_stop_vec
+    both <- terminal_is_stop_vec & downstream_is_stop_vec %in% TRUE
+    neither <- !terminal_is_stop_vec & !(downstream_is_stop_vec %in% TRUE)
+
+    resolved_stop_convention[included_only] <- "included"
+    stop_adjustment_nt[included_only] <- 0L
+    stop_normalization_status[included_only] <-
+      "auto: input coordinates include stop codon"
+    resolved_stop_convention[excluded_only] <- "excluded"
+    stop_adjustment_nt[excluded_only] <- 3L
+    stop_normalization_status[excluded_only] <-
+      "auto: input coordinates exclude stop codon; added 3 transcript nt"
+    stop_normalization_status[both] <-
+      "auto: terminal and downstream triplets are both stop codons"
+    stop_normalization_status[neither] <-
+      "auto: neither terminal nor downstream triplet is a stop codon"
+  }
+
+  input_3p_tx_0b <- orf_5p_tx_all + input_len_nt - 1L
+  inclusive_3p_tx_0b <- input_3p_tx_0b + stop_adjustment_nt
+  exclusive_3p_tx_0b <- inclusive_3p_tx_0b - 3L
+  canonical_width_nt <- inclusive_3p_tx_0b - orf_5p_tx_all + 1L
+  coordinate_projection_valid <-
+    !is.na(orf_5p_tx_all) & !is.na(inclusive_3p_tx_0b) &
+    exclusive_3p_tx_0b >= orf_5p_tx_all &
+    inclusive_3p_tx_0b < tx_len_per_orf
+
+  canonical_stop_codon <- ifelse(
+    resolved_stop_convention == "included",
+    terminal_codon_vec,
+    ifelse(
+      resolved_stop_convention == "excluded",
+      downstream_codon_vec,
+      NA_character_
+    )
+  )
+  canonical_stop_valid <-
+    coordinate_projection_valid & canonical_stop_codon %in% stop_codons
+  canonical_complete_codons <-
+    coordinate_projection_valid & canonical_width_nt %% 3L == 0L
+  stop_normalization_valid <-
+    canonical_stop_valid & canonical_complete_codons
+
+  stop_normalization_status[
+    !is.na(stop_adjustment_nt) & !coordinate_projection_valid
+  ] <- "normalised stop lies outside the compatible transcript"
+  stop_normalization_status[
+    coordinate_projection_valid & !canonical_stop_valid
+  ] <- "normalised terminal triplet is not a permitted stop codon"
+  stop_normalization_status[
+    canonical_stop_valid & !canonical_complete_codons
+  ] <- "normalised ORF length is not divisible by three"
+
+  projected_idx <- which(coordinate_projection_valid)
+  ranges_stop_inclusive <- GenomicRanges::GRangesList(
+    lapply(projected_idx, function(i) {
+      .slice_transcript_interval(
+        tx_by_orf[[i]],
+        orf_5p_tx_all[i] + 1L,
+        inclusive_3p_tx_0b[i] + 1L
+      )
+    })
+  )
+  names(ranges_stop_inclusive) <- ORF_isoform_id[projected_idx]
+
+  ranges_stop_exclusive <- GenomicRanges::GRangesList(
+    lapply(projected_idx, function(i) {
+      .slice_transcript_interval(
+        tx_by_orf[[i]],
+        orf_5p_tx_all[i] + 1L,
+        exclusive_3p_tx_0b[i] + 1L
+      )
+    })
+  )
+  names(ranges_stop_exclusive) <- ORF_isoform_id[projected_idx]
+
+  pair_range_bounds <- function(paths, pair_index, n_pairs) {
+    result <- list(
+      start = rep(NA_integer_, n_pairs),
+      end = rep(NA_integer_, n_pairs),
+      orf_3p = rep(NA_integer_, n_pairs)
+    )
+    if (!length(paths)) return(result)
+    bounds <- unlist(range(paths), use.names = FALSE)
+    path_strand <- as.character(GenomicRanges::strand(bounds))
+    result$start[pair_index] <- GenomicRanges::start(bounds)
+    result$end[pair_index] <- GenomicRanges::end(bounds)
+    result$orf_3p[pair_index] <- ifelse(
+      path_strand == "+",
+      GenomicRanges::end(bounds),
+      GenomicRanges::start(bounds)
+    )
+    result
+  }
+  bounds_stop_inclusive <- pair_range_bounds(
+    ranges_stop_inclusive, projected_idx, length(orf_in_tx)
+  )
+  bounds_stop_exclusive <- pair_range_bounds(
+    ranges_stop_exclusive, projected_idx, length(orf_in_tx)
+  )
+
+  # From this point `seq_nt`, translation, and the primary genomic coordinates
+  # describe the stop-inclusive chain returned in `ranges`.
+  if (length(projected_idx)) {
+    inclusive_start_1b <- orf_5p_tx_all[projected_idx] + 1L
+    inclusive_end_1b <- inclusive_3p_tx_0b[projected_idx] + 1L
+    seq_nt_chr[projected_idx] <- substring(
+      tx_seq_per_orf[projected_idx],
+      inclusive_start_1b,
+      inclusive_end_1b
+    )
+    seq_aa_chr[projected_idx] <- as.character(
+      Biostrings::translate(Biostrings::DNAStringSet(seq_nt_chr[projected_idx]))
+    )
+    genomic_st[projected_idx] <- bounds_stop_inclusive$start[projected_idx]
+    genomic_en[projected_idx] <- bounds_stop_inclusive$end[projected_idx]
+  }
+
   # --- Pre-compute lengths ---
   len_nt <- nchar(seq_nt_chr)
   len_aa <- nchar(gsub("*", "", seq_aa_chr, fixed = TRUE))
@@ -464,6 +626,20 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
     end                   = genomic_en,
     strand                = strands_vec,
     complete_codons       = complete_codons,
+    input_stop_convention = resolved_stop_convention,
+    stop_adjustment_nt    = stop_adjustment_nt,
+    stop_normalization_valid = stop_normalization_valid,
+    stop_normalization_status = stop_normalization_status,
+    start_stop_exclusive  = bounds_stop_exclusive$start,
+    end_stop_exclusive    = bounds_stop_exclusive$end,
+    orf_3p_stop_exclusive = bounds_stop_exclusive$orf_3p,
+    start_stop_inclusive  = bounds_stop_inclusive$start,
+    end_stop_inclusive    = bounds_stop_inclusive$end,
+    orf_3p_stop_inclusive = bounds_stop_inclusive$orf_3p,
+    canonical_stop_codon  = canonical_stop_codon,
+    canonical_complete_codons = canonical_complete_codons,
+    canonical_5p_tx       = as.integer(orf_5p_tx_all + 1L),
+    canonical_3p_tx       = as.integer(inclusive_3p_tx_0b + 1L),
     downstream_codon      = downstream_codon_vec,
     downstream_is_stop    = downstream_is_stop_vec,
     stop_codon_end        = stop_codon_end_vec
@@ -471,21 +647,15 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
     mutate(
       start_codon = substr(seq_nt, 1, 3),
       stop_codon  = substr(seq_nt, len_nt - 2, len_nt),
-      # orf_status is assigned after downstream_is_stop is available so that
-      # an ORF whose stop codon lies immediately downstream (not included in its
-      # coordinates) is still classified correctly.
-      # !(downstream_is_stop %in% TRUE) is TRUE for both FALSE and NA, so when
-      # check_stop_codon = FALSE (all NA) the logic is identical to before.
+      # Status uses the canonical stop-inclusive sequence. Invalid or
+      # unresolved normalisations are conservatively reported as no-stop.
       orf_status  = case_when(
+        !stop_normalization_valid & !(start_codon %in% start_codons) ~
+          "no_stop_no_start",
+        !stop_normalization_valid ~ "no_stop",
         # Internal stop codon anywhere before the final aa
         grepl("[*]", substr(seq_aa, 1, nchar(seq_aa) - 1)) ~ "internal_stop",
-        # No start AND no stop (in seq or downstream)
-        !(start_codon %in% start_codons) & !(stop_codon %in% stop_codons) &
-          !(downstream_is_stop %in% TRUE) ~ "no_stop_no_start",
-        # Has start but no stop (in seq or downstream)
-        !(stop_codon  %in% stop_codons) &
-          !(downstream_is_stop %in% TRUE) ~ "no_stop",
-        # Has stop (in seq or downstream) but no start
+        # Canonical sequence has a stop but no permitted start.
         !(start_codon %in% start_codons) ~ "no_start",
         TRUE ~ "translatable"
       )
@@ -604,6 +774,14 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
     orf_status$pct_orf_in_cds <- NA_real_
     orf_status$pct_cds_in_orf <- NA_real_
     orf_status$cds_frame      <- NA_character_
+    orf_status$coding_transcript <- NA
+    orf_status$cds_5p_tx <- NA_integer_
+    orf_status$cds_3p_tx <- NA_integer_
+    orf_status$start_in_cds_frame <- NA
+    orf_status$end_in_cds_frame <- NA
+    orf_status$reference_orf_type <- NA_character_
+    orf_status$reference_orf_class <- NA_character_
+    orf_status$reference_annotation_status <- NA_character_
 
     # Map each row to its pair index (NA for intronic / no-transcript stubs)
     row_pair_i <- pair_idx[orf_status$ORF_isoform_id]
@@ -612,6 +790,23 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
 
     tx_ids_valid <- names(tx_by_orf)[row_pair_i[valid_rows]]
     has_cds_ann  <- tx_ids_valid %in% names(cds_gr)
+    if (any(has_cds_ann)) {
+      has_cds_ann[has_cds_ann] <-
+        S4Vectors::elementNROWS(cds_gr[tx_ids_valid[has_cds_ann]]) > 0L
+    }
+    orf_status$coding_transcript[valid_rows] <- has_cds_ann
+    noncoding_rows <- valid_rows[!has_cds_ann]
+    noncoding_pairs <- row_pair_i[noncoding_rows]
+    noncoding_ready <- stop_normalization_valid[noncoding_pairs] %in% TRUE
+    orf_status$reference_orf_type[noncoding_rows[noncoding_ready]] <-
+      "varRNA-ORF"
+    orf_status$reference_orf_class[noncoding_rows[noncoding_ready]] <-
+      unname(.BILBORF_ORF_CLASS_MAP["varRNA-ORF"])
+    orf_status$reference_annotation_status[noncoding_rows] <- ifelse(
+      noncoding_ready,
+      "compatible transcript has no annotated CDS",
+      stop_normalization_status[noncoding_pairs]
+    )
     valid_rows_c <- valid_rows[has_cds_ann]
     tx_ids_c     <- tx_ids_valid[has_cds_ann]
     pairs_i_c    <- row_pair_i[valid_rows_c]
@@ -666,6 +861,14 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
         cds_tx_coord_k <- .genomic_5prime_to_tx_coord(cds_exons, tx_exons_k, strnd_k)
 
         if (!is.na(cds_tx_coord_k)) {
+          cds_3p_tx_coord_k <-
+            cds_tx_coord_k + sum(BiocGenerics::width(cds_exons)) - 1L
+          orf_5p_tx_k <- orf_5p_tx_all[pairs_k]
+          orf_3p_tx_k <- inclusive_3p_tx_0b[pairs_k]
+
+          orf_status$cds_5p_tx[rows_k] <- cds_tx_coord_k + 1L
+          orf_status$cds_3p_tx[rows_k] <- cds_3p_tx_coord_k + 1L
+
           # Batch ORF 5' genomic positions using tapply on the already-flat vector
           g_vec_k <- if (strnd_k == "+") {
             as.integer(tapply(start(orf_exons_flat), orf_grp, min))
@@ -681,6 +884,39 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
             (orf_tx_coords_k[valid_frame] - cds_tx_coord_k) %% 3L == 0L,
             "in_frame", "out_of_frame"
           )
+
+          classification_ready <-
+            stop_normalization_valid[pairs_k] %in% TRUE &
+            !is.na(orf_5p_tx_k) & !is.na(orf_3p_tx_k)
+          if (any(classification_ready)) {
+            classified_rows <- rows_k[classification_ready]
+            classified_types <- .classify_orf_cds_geometry(
+              orf_5p_tx_k[classification_ready],
+              orf_3p_tx_k[classification_ready],
+              rep(cds_tx_coord_k, sum(classification_ready)),
+              rep(cds_3p_tx_coord_k, sum(classification_ready))
+            )
+            start_frame <-
+              (orf_5p_tx_k[classification_ready] - cds_tx_coord_k) %% 3L == 0L
+            end_frame <-
+              (orf_3p_tx_k[classification_ready] - cds_3p_tx_coord_k) %% 3L == 0L
+
+            orf_status$start_in_cds_frame[classified_rows] <- start_frame
+            orf_status$end_in_cds_frame[classified_rows] <- end_frame
+            orf_status$reference_orf_type[classified_rows] <- classified_types
+            orf_status$reference_orf_class[classified_rows] <- unname(
+              .BILBORF_ORF_CLASS_MAP[classified_types]
+            )
+            orf_status$reference_annotation_status[classified_rows] <-
+              "classified against annotated CDS"
+          }
+
+          not_ready <- !classification_ready
+          orf_status$reference_annotation_status[rows_k[not_ready]] <-
+            stop_normalization_status[pairs_k[not_ready]]
+        } else {
+          orf_status$reference_annotation_status[rows_k] <-
+            "CDS could not be projected onto transcript"
         }
       }
 
@@ -694,10 +930,35 @@ annotate_orf_isoforms <- function(annotations, orfs, BSgenome,
     dplyr::relocate(ORF_isoform_id, ORF_id, transcript_id, gene_id, gene_name,
                     seqnames, start, end, strand, start_codon, stop_codon,
                     orf_status, unique_aa_id, complete_codons,
+                    dplyr::any_of(c(
+                      "input_stop_convention", "stop_adjustment_nt",
+                      "stop_normalization_valid", "stop_normalization_status",
+                      "start_stop_exclusive", "end_stop_exclusive",
+                      "orf_3p_stop_exclusive", "start_stop_inclusive",
+                      "end_stop_inclusive", "orf_3p_stop_inclusive",
+                      "canonical_stop_codon", "canonical_complete_codons",
+                      "canonical_5p_tx", "canonical_3p_tx"
+                    )),
                     dplyr::any_of(c("downstream_codon", "downstream_is_stop",
                                     "stop_codon_end", "overlaps_cds",
                                     "pct_orf_in_cds", "pct_cds_in_orf",
-                                    "cds_frame")))
+                                    "cds_frame", "coding_transcript",
+                                    "cds_5p_tx", "cds_3p_tx",
+                                    "start_in_cds_frame", "end_in_cds_frame",
+                                    "reference_orf_type",
+                                    "reference_orf_class",
+                                    "reference_annotation_status")))
 
-  return(list(table = orf_status, ranges = orf_in_tx))
+  if ("reference_orf_type" %in% names(orf_status)) {
+    orf_status$reference_orf_type <- factor(
+      orf_status$reference_orf_type,
+      levels = .BILBORF_ORF_TYPE_LEVELS
+    )
+    orf_status$reference_orf_class <- factor(
+      orf_status$reference_orf_class,
+      levels = c("canonical", "variant of canonical", "non-canonical")
+    )
+  }
+
+  return(list(table = orf_status, ranges = ranges_stop_inclusive))
 }

@@ -201,6 +201,20 @@ orf_type_levels <- function() {
   do.call(ORFik::pmapToTranscriptF, args)
 }
 
+.point_within_transcript <- function(x, transcripts) {
+  if (length(x) != length(transcripts)) {
+    stop("Internal error: point and transcript pair counts differ",
+         call. = FALSE)
+  }
+  point <- as.integer(GenomicRanges::start(x))
+  tx_starts <- GenomicRanges::start(transcripts)
+  tx_ends <- GenomicRanges::end(transcripts)
+
+  vapply(seq_along(point), function(i) {
+    any(point[[i]] >= tx_starts[[i]] & point[[i]] <= tx_ends[[i]])
+  }, logical(1))
+}
+
 #' Re-annotate ORF type from transcript and CDS geometry
 #'
 #' Classify genomic ORFs relative to every compatible reference transcript and
@@ -210,8 +224,9 @@ orf_type_levels <- function() {
 #'
 #' @param orfs A `GRanges` with one genomic bounding range per ORF, or a
 #'   `GRangesList` with one exon-resolved range chain per ORF. Each ORF must use
-#'   one seqname and an explicit `+` or `-` strand. Coordinates must use the
-#'   same inclusive boundary convention as `cds_by_tx`.
+#'   one seqname and an explicit `+` or `-` strand. Coordinates are 1-based and
+#'   inclusive; use `stop_codon_convention` to describe whether the 3' endpoint
+#'   includes the stop codon.
 #' @param transcripts A `GRangesList` of transcript exons with unique transcript
 #'   IDs in `names(transcripts)`.
 #' @param cds_by_tx A `GRangesList` of CDS exons named in the same transcript-ID
@@ -222,6 +237,24 @@ orf_type_levels <- function() {
 #' @param type_priority Character vector containing every value returned by
 #'   [orf_type_levels()] exactly once. It determines which interpretation wins
 #'   when an ORF has different types on different transcript isoforms.
+#' @param stop_codon_convention How the ORF 3' boundary represents the stop
+#'   codon. `"included"` requires the ORF and CDS 3' endpoints to use the same
+#'   inclusive coordinate. `"excluded"` adds 3 nt to every ORF 3' endpoint for
+#'   classification. The default, `"auto"`, adds 3 nt only when an ORF endpoint
+#'   is exactly 3 nt before the annotated CDS endpoint. This handles callers
+#'   that report the last coding nucleotide while retaining exact matches from
+#'   callers that include the stop codon. The applied adjustment is reported in
+#'   both output tables. Use `"included"` for strict boundary comparison.
+#' @param allow_terminal_extrapolation Logical. When `TRUE`, a short ORF
+#'   overhang beyond an annotated transcript end may be extrapolated to infer an
+#'   in-frame N-, C-, or NC-terminal extension when no complete transcript
+#'   interpretation exists.
+#' @param max_terminal_overhang Maximum number of nucleotides allowed beyond
+#'   either annotated transcript end during terminal extrapolation.
+#' @param unmatched_type Value used when no complete or extrapolated reference
+#'   interpretation is possible. The default `NA_character_` avoids conflating
+#'   unsupported ORFs with `varRNA-ORF`. A non-missing value must be present in
+#'   [orf_type_levels()].
 #'
 #' @return A list with two tibbles:
 #' \describe{
@@ -250,13 +283,21 @@ orf_type_levels <- function() {
 #' * wholly upstream/downstream: `uORF`/`dORF`;
 #' * overlapping the CDS from upstream/downstream: `uoORF`/`doORF`;
 #' * contained within the CDS after the exact/truncation rules: `intORF`;
-#' * a compatible transcript without a CDS, or no compatible transcript:
-#'   `varRNA-ORF`.
+#' * a compatible transcript without a CDS: `varRNA-ORF`.
+#'
+#' With `stop_codon_convention = "auto"`, a 3-nt-short ORF 3' boundary is
+#' interpreted as an omitted annotated stop codon. Because genomic coordinates
+#' alone cannot distinguish that convention from a genuine one-codon
+#' C-terminal truncation, use `"included"` when all ORF inputs are known to
+#' include their stop codons.
 #'
 #' Exact CDS and in-frame canonical variants take precedence over a
-#' non-canonical interpretation on another isoform by default. This function
-#' uses geometry only; it does not inspect genomic sequence for start codons,
-#' stop codons, or internal stops.
+#' non-canonical interpretation on another isoform by default. Complete
+#' transcript interpretations always take precedence over inferred terminal
+#' extrapolations. Extrapolation is limited to canonical terminal extensions,
+#' requires compatible splice geometry, and is reported explicitly in the
+#' output. This function uses geometry only; it does not inspect genomic
+#' sequence for start codons, stop codons, or internal stops.
 #'
 #' @examples
 #' library(GenomicRanges)
@@ -278,19 +319,44 @@ reannotate_orf_type <- function(
     transcripts,
     cds_by_tx,
     id_col = NULL,
-    type_priority = .BILBORF_REFERENCE_ORF_TYPE_PRIORITY) {
+    type_priority = .BILBORF_REFERENCE_ORF_TYPE_PRIORITY,
+    stop_codon_convention = c("auto", "included", "excluded"),
+    allow_terminal_extrapolation = TRUE,
+    max_terminal_overhang = 30L,
+    unmatched_type = NA_character_) {
 
   orf_geometry <- .prepare_orf_geometry(orfs)
   orf_chains <- orf_geometry$chains
   orf_spans <- orf_geometry$spans
   .validate_named_grl(transcripts, "transcripts")
   .validate_named_grl(cds_by_tx, "cds_by_tx")
+  stop_codon_convention <- match.arg(stop_codon_convention)
 
   if (!setequal(type_priority, .BILBORF_ORF_TYPE_LEVELS) ||
       anyDuplicated(type_priority) ||
       length(type_priority) != length(.BILBORF_ORF_TYPE_LEVELS)) {
     stop("type_priority must contain every supported ORF type exactly once",
          call. = FALSE)
+  }
+  if (!is.logical(allow_terminal_extrapolation) ||
+      length(allow_terminal_extrapolation) != 1L ||
+      is.na(allow_terminal_extrapolation)) {
+    stop("allow_terminal_extrapolation must be TRUE or FALSE", call. = FALSE)
+  }
+  if (!is.numeric(max_terminal_overhang) ||
+      length(max_terminal_overhang) != 1L ||
+      is.na(max_terminal_overhang) || !is.finite(max_terminal_overhang) ||
+      max_terminal_overhang < 0 ||
+      max_terminal_overhang > .Machine$integer.max ||
+      max_terminal_overhang != floor(max_terminal_overhang)) {
+    stop("max_terminal_overhang must be one non-negative integer",
+         call. = FALSE)
+  }
+  max_terminal_overhang <- as.integer(max_terminal_overhang)
+  if (length(unmatched_type) != 1L ||
+      (!is.na(unmatched_type) &&
+       !unmatched_type %in% .BILBORF_ORF_TYPE_LEVELS)) {
+    stop("unmatched_type must be NA or one supported ORF type", call. = FALSE)
   }
   orf_ids <- if (!is.null(id_col)) {
     if (!id_col %in% colnames(GenomicRanges::mcols(orfs))) {
@@ -318,10 +384,19 @@ reannotate_orf_type <- function(
 
   pair_template <- tibble::tibble(
     orf_id = character(), transcript_id = character(),
-    coding_transcript = logical(), boundaries_exonic = logical(),
+    coding_transcript = logical(),
+    boundary_5p_exonic = logical(), boundary_3p_exonic = logical(),
+    boundaries_exonic = logical(),
     splice_chain_checked = logical(), splice_chain_compatible = logical(),
     orf_5p_tx = integer(), orf_3p_tx = integer(),
+    orf_5p_tx_effective = integer(), orf_3p_tx_effective = integer(),
+    overhang_5p_nt = integer(), overhang_3p_nt = integer(),
+    terminal_extrapolation_candidate = logical(),
+    terminal_extrapolation_used = logical(),
     cds_5p_tx = integer(), cds_3p_tx = integer(),
+    orf_3p_tx_classification = integer(),
+    stop_boundary_adjustment_nt = integer(),
+    stop_boundary_adjusted = logical(),
     start_in_cds_frame = logical(), end_in_cds_frame = logical(),
     reference_orf_type = character(), annotation_status = character()
   )
@@ -348,11 +423,75 @@ reannotate_orf_type <- function(
 
     orf_5p_tx <- as.integer(GenomicRanges::start(orf_5p_mapped))
     orf_3p_tx <- as.integer(GenomicRanges::start(orf_3p_mapped))
+    boundary_5p_exonic <-
+      .point_within_transcript(orf_5p_g, pair_tx) &
+      orf_5p_tx > 0L &
+      as.character(GenomicRanges::strand(orf_5p_mapped)) != "*"
+    boundary_3p_exonic <-
+      .point_within_transcript(orf_3p_g, pair_tx) &
+      orf_3p_tx > 0L &
+      as.character(GenomicRanges::strand(orf_3p_mapped)) != "*"
     boundaries_exonic <-
-      orf_5p_tx > 0L & orf_3p_tx > 0L &
-      as.character(GenomicRanges::strand(orf_5p_mapped)) != "*" &
-      as.character(GenomicRanges::strand(orf_3p_mapped)) != "*" &
+      boundary_5p_exonic & boundary_3p_exonic &
       orf_5p_tx <= orf_3p_tx
+
+    tx_5p_g <- ORFik::startSites(
+      pair_tx, asGR = TRUE, keep.names = FALSE, is.sorted = FALSE
+    )
+    tx_3p_g <- ORFik::stopSites(
+      pair_tx, asGR = TRUE, keep.names = FALSE, is.sorted = FALSE
+    )
+    tx_width <- vapply(
+      GenomicRanges::width(pair_tx), sum, integer(1)
+    )
+    transcript_direction <- ifelse(
+      as.character(GenomicRanges::strand(tx_5p_g)) == "+", 1L, -1L
+    )
+    delta_5p <-
+      (GenomicRanges::start(orf_5p_g) -
+       GenomicRanges::start(tx_5p_g)) * transcript_direction
+    delta_3p <-
+      (GenomicRanges::start(orf_3p_g) -
+       GenomicRanges::start(tx_3p_g)) * transcript_direction
+    overhang_5p_nt <- as.integer(pmax(-delta_5p, 0L))
+    overhang_3p_nt <- as.integer(pmax(delta_3p, 0L))
+    candidate_5p_extrapolation <-
+      !boundary_5p_exonic & delta_5p < 0L
+    candidate_3p_extrapolation <-
+      !boundary_3p_exonic & delta_3p > 0L
+    within_5p_limit <-
+      candidate_5p_extrapolation &
+      overhang_5p_nt <= max_terminal_overhang
+    within_3p_limit <-
+      candidate_3p_extrapolation &
+      overhang_3p_nt <= max_terminal_overhang
+    supported_5p_boundary <-
+      boundary_5p_exonic |
+      (allow_terminal_extrapolation & within_5p_limit)
+    supported_3p_boundary <-
+      boundary_3p_exonic |
+      (allow_terminal_extrapolation & within_3p_limit)
+    terminal_extrapolation_candidate <-
+      candidate_5p_extrapolation | candidate_3p_extrapolation
+
+    orf_5p_tx_effective <- ifelse(
+      boundary_5p_exonic,
+      orf_5p_tx,
+      ifelse(
+        allow_terminal_extrapolation & within_5p_limit,
+        1L - overhang_5p_nt,
+        NA_integer_
+      )
+    )
+    orf_3p_tx_effective <- ifelse(
+      boundary_3p_exonic,
+      orf_3p_tx,
+      ifelse(
+        allow_terminal_extrapolation & within_3p_limit,
+        tx_width + overhang_3p_nt,
+        NA_integer_
+      )
+    )
 
     splice_chain_checked <- rep(
       orf_geometry$splice_chain_supplied, length(qh)
@@ -363,6 +502,13 @@ reannotate_orf_type <- function(
         pair_orfs_grl, pair_tx
       )
     }
+    extrapolation_geometry_ready <-
+      allow_terminal_extrapolation &
+      terminal_extrapolation_candidate &
+      supported_5p_boundary & supported_3p_boundary &
+      splice_chain_compatible &
+      !is.na(orf_5p_tx_effective) & !is.na(orf_3p_tx_effective) &
+      orf_5p_tx_effective <= orf_3p_tx_effective
 
     coding_transcript <- pair_tx_ids %in% names(cds_by_tx)
     coding_i <- which(coding_transcript)
@@ -400,30 +546,97 @@ reannotate_orf_type <- function(
     cds_projected <-
       !is.na(cds_5p_tx) & !is.na(cds_3p_tx) &
       cds_5p_tx > 0L & cds_3p_tx > 0L & cds_5p_tx <= cds_3p_tx
-    compatible_geometry <- boundaries_exonic & splice_chain_compatible
-    classifiable <- compatible_geometry & coding_transcript & cds_projected
+    complete_geometry <- boundaries_exonic & splice_chain_compatible
+    classification_geometry <-
+      complete_geometry | extrapolation_geometry_ready
+    preclassifiable <-
+      classification_geometry & coding_transcript & cds_projected
+
+    stop_boundary_adjustment_nt <- rep(0L, length(qh))
+    if (stop_codon_convention == "excluded") {
+      stop_boundary_adjustment_nt[preclassifiable] <- 3L
+    } else if (stop_codon_convention == "auto") {
+      omitted_annotated_stop <-
+        preclassifiable &
+        cds_3p_tx - orf_3p_tx_effective == 3L
+      stop_boundary_adjustment_nt[omitted_annotated_stop] <- 3L
+    }
+    stop_boundary_adjusted <- stop_boundary_adjustment_nt != 0L
+    orf_3p_tx_classification <-
+      orf_3p_tx_effective + stop_boundary_adjustment_nt
 
     start_in_cds_frame <- rep(NA, length(qh))
     end_in_cds_frame <- rep(NA, length(qh))
-    start_in_cds_frame[classifiable] <-
-      (orf_5p_tx[classifiable] - cds_5p_tx[classifiable]) %% 3L == 0L
-    end_in_cds_frame[classifiable] <-
-      (orf_3p_tx[classifiable] - cds_3p_tx[classifiable]) %% 3L == 0L
+    start_in_cds_frame[preclassifiable] <-
+      (orf_5p_tx_effective[preclassifiable] -
+       cds_5p_tx[preclassifiable]) %% 3L == 0L
+    end_in_cds_frame[preclassifiable] <-
+      (orf_3p_tx_classification[preclassifiable] -
+       cds_3p_tx[preclassifiable]) %% 3L == 0L
+
+    provisional_type <- rep(NA_character_, length(qh))
+    provisional_type[preclassifiable] <- .classify_orf_cds_geometry(
+      orf_5p_tx_effective[preclassifiable],
+      orf_3p_tx_classification[preclassifiable],
+      cds_5p_tx[preclassifiable], cds_3p_tx[preclassifiable]
+    )
+    extrapolated_extension_types <- c(
+      "N-terminal extension", "C-terminal extension",
+      "NC-terminal extension"
+    )
+    extrapolation_type_valid <-
+      !extrapolation_geometry_ready |
+      provisional_type %in% extrapolated_extension_types
+    classifiable <- preclassifiable & extrapolation_type_valid
+    terminal_extrapolation_used <-
+      extrapolation_geometry_ready & classifiable
 
     reference_orf_type <- rep(NA_character_, length(qh))
-    reference_orf_type[compatible_geometry & !coding_transcript] <-
+    reference_orf_type[complete_geometry & !coding_transcript] <-
       "varRNA-ORF"
-    reference_orf_type[classifiable] <- .classify_orf_cds_geometry(
-      orf_5p_tx[classifiable], orf_3p_tx[classifiable],
-      cds_5p_tx[classifiable], cds_3p_tx[classifiable]
-    )
+    reference_orf_type[classifiable] <- provisional_type[classifiable]
+
+    overhang_exceeds_limit <-
+      (candidate_5p_extrapolation &
+       overhang_5p_nt > max_terminal_overhang) |
+      (candidate_3p_extrapolation &
+       overhang_3p_nt > max_terminal_overhang)
+    nonterminal_boundary_failure <-
+      (!boundary_5p_exonic & !candidate_5p_extrapolation) |
+      (!boundary_3p_exonic & !candidate_3p_extrapolation)
 
     annotation_status <- dplyr::case_when(
-      !boundaries_exonic ~ "ORF boundary not exonic on transcript",
       !splice_chain_compatible ~
         "ORF splice chain is incompatible with transcript",
-      !coding_transcript ~ "compatible transcript has no annotated CDS",
-      !cds_projected ~ "CDS could not be projected onto transcript",
+      complete_geometry & !coding_transcript ~
+        "compatible transcript has no annotated CDS",
+      complete_geometry & !cds_projected ~
+        "CDS could not be projected onto transcript",
+      complete_geometry & stop_boundary_adjusted ~
+        paste0(
+          "classified against annotated CDS after ",
+          stop_boundary_adjustment_nt, " nt stop-codon adjustment"
+        ),
+      complete_geometry ~ "classified against annotated CDS",
+      terminal_extrapolation_candidate &
+        !allow_terminal_extrapolation ~
+        "ORF extends beyond transcript; terminal extrapolation disabled",
+      overhang_exceeds_limit ~
+        "ORF terminal overhang exceeds max_terminal_overhang",
+      nonterminal_boundary_failure ~
+        "ORF boundary not exonic and not beyond a transcript terminus",
+      extrapolation_geometry_ready & !coding_transcript ~
+        "terminal extrapolation requires an annotated CDS",
+      extrapolation_geometry_ready & !cds_projected ~
+        "CDS could not be projected for terminal extrapolation",
+      extrapolation_geometry_ready & !extrapolation_type_valid ~
+        "terminal extrapolation does not support an in-frame canonical extension",
+      terminal_extrapolation_used ~
+        paste0(
+          "classified using terminal extrapolation (5': ",
+          overhang_5p_nt, " nt; 3': ", overhang_3p_nt, " nt)"
+        ),
+      !boundaries_exonic ~ "ORF boundary not exonic on transcript",
       .default = "classified against annotated CDS"
     )
 
@@ -431,13 +644,28 @@ reannotate_orf_type <- function(
       orf_id = orf_ids[qh],
       transcript_id = pair_tx_ids,
       coding_transcript = coding_transcript,
+      boundary_5p_exonic = boundary_5p_exonic,
+      boundary_3p_exonic = boundary_3p_exonic,
       boundaries_exonic = boundaries_exonic,
       splice_chain_checked = splice_chain_checked,
       splice_chain_compatible = splice_chain_compatible,
       orf_5p_tx = orf_5p_tx,
       orf_3p_tx = orf_3p_tx,
+      orf_5p_tx_effective = as.integer(orf_5p_tx_effective),
+      orf_3p_tx_effective = as.integer(orf_3p_tx_effective),
+      overhang_5p_nt = ifelse(
+        candidate_5p_extrapolation, overhang_5p_nt, 0L
+      ),
+      overhang_3p_nt = ifelse(
+        candidate_3p_extrapolation, overhang_3p_nt, 0L
+      ),
+      terminal_extrapolation_candidate = terminal_extrapolation_candidate,
+      terminal_extrapolation_used = terminal_extrapolation_used,
       cds_5p_tx = cds_5p_tx,
       cds_3p_tx = cds_3p_tx,
+      orf_3p_tx_classification = as.integer(orf_3p_tx_classification),
+      stop_boundary_adjustment_nt = stop_boundary_adjustment_nt,
+      stop_boundary_adjusted = stop_boundary_adjusted,
       start_in_cds_frame = start_in_cds_frame,
       end_in_cds_frame = end_in_cds_frame,
       reference_orf_type = reference_orf_type,
@@ -447,9 +675,13 @@ reannotate_orf_type <- function(
 
   valid_pairs <- pair_table |>
     dplyr::filter(
-      boundaries_exonic, splice_chain_compatible,
-      !is.na(reference_orf_type)
+      splice_chain_compatible, !is.na(reference_orf_type)
     ) |>
+    dplyr::group_by(orf_id) |>
+    dplyr::filter(
+      !any(!terminal_extrapolation_used) | !terminal_extrapolation_used
+    ) |>
+    dplyr::ungroup() |>
     dplyr::mutate(.priority = match(reference_orf_type, type_priority))
 
   best_pair <- valid_pairs |>
@@ -465,6 +697,11 @@ reannotate_orf_type <- function(
       reference_end_in_frame = end_in_cds_frame,
       reference_splice_chain_checked = splice_chain_checked,
       reference_splice_chain_compatible = splice_chain_compatible,
+      reference_boundary_extrapolated = terminal_extrapolation_used,
+      reference_5p_overhang_nt = overhang_5p_nt,
+      reference_3p_overhang_nt = overhang_3p_nt,
+      reference_stop_boundary_adjusted = stop_boundary_adjusted,
+      reference_stop_boundary_adjustment_nt = stop_boundary_adjustment_nt,
       reference_annotation_status = annotation_status
     )
 
@@ -480,7 +717,7 @@ reannotate_orf_type <- function(
     )
 
   fallback_status <- rep(
-    "no transcript carries both ORF boundaries; fallback",
+    "no compatible reference interpretation; unclassified",
     length(orf_ids)
   )
   names(fallback_status) <- orf_ids
@@ -489,10 +726,18 @@ reannotate_orf_type <- function(
     chain_ids <- unique(pair_table$orf_id[
       pair_table$boundaries_exonic & pair_table$splice_chain_compatible
     ])
+    extrapolation_ids <- unique(pair_table$orf_id[
+      pair_table$terminal_extrapolation_candidate
+    ])
     fallback_status[boundary_ids] <-
-      "no transcript has a compatible ORF splice chain; fallback"
+      "no transcript has a compatible ORF splice chain; unclassified"
     fallback_status[chain_ids] <-
-      "compatible transcript could not be classified; fallback"
+      "compatible transcript could not be classified; unclassified"
+    fallback_status[extrapolation_ids] <-
+      paste0(
+        "terminal extrapolation did not yield a valid canonical extension; ",
+        "unclassified"
+      )
   }
 
   orf_table <- tibble::tibble(
@@ -507,20 +752,33 @@ reannotate_orf_type <- function(
     dplyr::left_join(best_pair, by = "orf_id") |>
     dplyr::left_join(pair_summary, by = "orf_id") |>
     dplyr::mutate(
-      reference_orf_type = dplyr::coalesce(
-        reference_orf_type, "varRNA-ORF"
-      ),
+      reference_orf_type = if (is.na(unmatched_type)) {
+        reference_orf_type
+      } else {
+        dplyr::coalesce(reference_orf_type, unmatched_type)
+      },
       reference_annotation_status = dplyr::coalesce(
         reference_annotation_status,
         unname(fallback_status[orf_id])
+      ),
+      reference_boundary_extrapolated = dplyr::coalesce(
+        reference_boundary_extrapolated, FALSE
+      ),
+      reference_stop_boundary_adjusted = dplyr::coalesce(
+        reference_stop_boundary_adjusted, FALSE
+      ),
+      reference_stop_boundary_adjustment_nt = dplyr::coalesce(
+        reference_stop_boundary_adjustment_nt, 0L
       ),
       n_compatible_transcripts = dplyr::coalesce(
         n_compatible_transcripts, 0L
       ),
       n_reference_orf_types = dplyr::coalesce(n_reference_orf_types, 0L),
-      all_reference_orf_types = dplyr::coalesce(
-        all_reference_orf_types, "varRNA-ORF"
-      ),
+      all_reference_orf_types = if (is.na(unmatched_type)) {
+        all_reference_orf_types
+      } else {
+        dplyr::coalesce(all_reference_orf_types, unmatched_type)
+      },
       reference_type_ambiguous = dplyr::coalesce(
         reference_type_ambiguous, FALSE
       ),

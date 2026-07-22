@@ -51,8 +51,8 @@ tx_neg <- GRanges(\"chr1\",
                   strand = \"-\")
 grl_neg <- GRangesList(gene1 = tx_neg)
 ranked_neg <- rank_exons(grl_neg)
-ranked_neg$gene1$exon_rank  # 3, 2, 1 (then sorted to 1, 2, 3 by position)
-start(ranked_neg$gene1)     # 300, 200, 100 (sorted by rank)
+ranked_neg$gene1$exon_rank  # 1, 2, 3 (sorted by rank)
+start(ranked_neg$gene1)     # 300, 200, 100 (sorted 5' to 3' on - strand)
 
 }
 \seealso{

@@ -10,7 +10,9 @@ parse_orfs(
   genome_style = "UCSC",
   min_length = NULL,
   output = c("unified", "full"),
-  additional_cols = NULL
+  additional_cols = NULL,
+  txdb = NULL,
+  ribocode_extend_stop = TRUE
 )
 }
 \arguments{
@@ -31,7 +33,20 @@ orf_width, orf_id); \code{"full"} returns a list with both
 the unified GRanges and a data.frame of all caller-specific metrics.}
 
 \item{additional_cols}{Character vector of extra caller-specific columns
-to retain. Only used when \code{output = "full"}.}
+to retain in the output. Columns are included in both \code{"unified"}
+and \code{"full"} output modes.}
+
+\item{txdb}{Optional TxDb object or GRangesList of transcript exon structures.
+Required for callers like RiboCode that need splicing-aware coordinate
+adjustment. If NULL (default), genomic coordinate extension is used with
+a warning for multi-exon ORFs. Can be created with
+\code{GenomicFeatures::makeTxDbFromGFF()} or loaded from packages like
+\code{TxDb.Hsapiens.UCSC.hg38.knownGene}.}
+
+\item{ribocode_extend_stop}{Logical. If \code{TRUE} (default), RiboCode
+coordinates are extended by 3 nt to include the stop codon (RiboCode reports
+coordinates excluding the stop codon). Set to \code{FALSE} to use
+RiboCode's original coordinates without modification. Ignored for other callers.}
 }
 \value{
 If \code{output = "unified"} (default), a GRanges with one range
